@@ -8,10 +8,6 @@ struct MineResult {
     uint32_t fh_be[8];   // DEBUG: winning hash
 };
 
-__device__ __forceinline__ uint64_t bswap64(uint64_t x) {
-    return __byte_perm(x>>32, x, 0x0123) | ((uint64_t)__byte_perm(x>>32, x, 0x4567) << 32);
-}
-
 __device__ __forceinline__ void load_dag_element(
     const uint8_t* __restrict__ dag,
     uint32_t idx,
@@ -50,6 +46,23 @@ __device__ __forceinline__ void blake2b_hash_31(const uint8_t* in, uint64_t out[
     out[0]=h[0]; out[1]=h[1]; out[2]=h[2]; out[3]=h[3];
 }
 
+// Blake2b-256 of 32 bytes (4 uint64 LE words) -> 32 bytes (4 uint64)
+// Used for genIndexes second hash step.
+__device__ __forceinline__ void blake2b_256_32(const uint64_t in[4], uint64_t out[4]) {
+    uint64_t h[8];
+    h[0] = 0x6A09E667F3BCC908ULL ^ (0x01010000ULL | 32);
+    h[1] = 0xBB67AE8584CAA73BULL;
+    h[2] = 0x3C6EF372FE94F82BULL;
+    h[3] = 0xA54FF53A5F1D36F1ULL;
+    h[4] = 0x510E527FADE682D1ULL;
+    h[5] = 0x9B05688C2B3E6C1FULL;
+    h[6] = 0x1F83D9ABFB41BD6BULL;
+    h[7] = 0x5BE0CD19137E2179ULL;
+    uint64_t m[16] = {in[0], in[1], in[2], in[3], 0,0,0,0,0,0,0,0,0,0,0,0};
+    blake2b_compress(h, m, 32ULL, 0ULL, true);
+    out[0]=h[0]; out[1]=h[1]; out[2]=h[2]; out[3]=h[3];
+}
+
 __global__ void mine_kernel(
     const uint8_t* __restrict__ dag,
     uint64_t N,
@@ -57,8 +70,7 @@ __global__ void mine_kernel(
     uint64_t nonce_start,
     uint32_t batch_size,
     const uint32_t* __restrict__ target,
-    MineResult* result,
-    int nonce_shift)
+    MineResult* result)
 {
     uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if(tid >= batch_size) return;
@@ -66,34 +78,40 @@ __global__ void mine_kernel(
 
     uint64_t nonce = nonce_start + (uint64_t)tid;
 
-    // Step 1: seed = Blake2b_64(blob[32] || nonce_BE[8])
-    // FIX v0.7: nonce is now hashed as big-endian bytes (see blake2b_hash_40)
-    // FIX v0.10: left-align nonce bytes in 8-byte field to match pool verification.
-    // Pool nonce_total_size may be < 8 bytes; the nonce bytes occupy the HIGH bytes
-    // of the 8-byte field with zero padding on the right.
-    // e.g. 6-byte nonce "dd232a59ca5a" -> bytes dd 23 2a 59 ca 5a 00 00
-    uint64_t seed64[8];
-    blake2b_hash_40(blob_words, nonce << nonce_shift, seed64);
+    // Step 1: seed = Blake2b256(msg[32] || nonce_BE[8]) -> 32 bytes
+    uint64_t seed[4];
+    blake2b_hash_40(blob_words, nonce, seed);
 
-    // Step 2: extendedHash - take high 32 bits of each bswap'd seed word
-    uint32_t ext[9];
+    // Step 2: hash = Blake2b256(seed) -> 32 bytes [genIndexes internal hash]
+    // Ergo reference: genIndexes(seed) first hashes the seed again.
+    uint64_t hash[4];
+    blake2b_256_32(seed, hash);
+
+    // Step 3: Build 35-byte extended hash (32 bytes + wrap first 3 bytes)
+    // hash[4] is LE uint64 words -> bytes in memory order.
+    uint8_t extended[36];
     #pragma unroll
-    for(int i=0; i<8; i++)
-        ext[i] = (uint32_t)(bswap64(seed64[i]) >> 32);
-    ext[8] = ext[0];
+    for(int i=0; i<4; i++){
+        #pragma unroll
+        for(int j=0; j<8; j++)
+            extended[i*8+j] = (uint8_t)(hash[i] >> (j*8));
+    }
+    extended[32] = extended[0];
+    extended[33] = extended[1];
+    extended[34] = extended[2];
 
-    // Step 3: 32 indexes
+    // Step 4: Generate 32 indices via sliding 4-byte big-endian window
     uint32_t idx[32];
     #pragma unroll
-    for(int i=0; i<8; i++){
-        uint32_t hi=ext[i], lo=ext[i+1];
-        idx[i*4+0] = (uint32_t)((uint64_t)hi % N);
-        idx[i*4+1] = (uint32_t)((((uint64_t)hi << 8)  | (lo >> 24)) % N);
-        idx[i*4+2] = (uint32_t)((((uint64_t)hi << 16) | (lo >> 16)) % N);
-        idx[i*4+3] = (uint32_t)((((uint64_t)hi << 24) | (lo >>  8)) % N);
+    for(int i=0; i<32; i++){
+        uint32_t v = ((uint32_t)extended[i]   << 24) |
+                     ((uint32_t)extended[i+1] << 16) |
+                     ((uint32_t)extended[i+2] <<  8) |
+                      (uint32_t)extended[i+3];
+        idx[i] = (uint32_t)((uint64_t)v % N);
     }
 
-    // Step 4: sum 32 DAG elements (31-byte bignum addition)
+    // Step 5: Sum 32 DAG elements (31-byte big-endian addition)
     uint8_t sum[31] = {};
     uint8_t elem[31];
     #pragma unroll 4
@@ -102,11 +120,11 @@ __global__ void mine_kernel(
         add248(sum, elem);
     }
 
-    // Step 5: final hash
+    // Step 6: Final hash = Blake2b256(sum[31])
     uint64_t final_hash[4];
     blake2b_hash_31(sum, final_hash);
 
-    // Step 6: convert to BE uint32 for comparison
+    // Step 7: Convert to big-endian uint32 words for comparison
     uint32_t fh_be[8];
     #pragma unroll
     for(int i=0; i<4; i++){
@@ -116,7 +134,7 @@ __global__ void mine_kernel(
         fh_be[i*2+1] = __byte_perm(hi32, 0, 0x0123);
     }
 
-    // Step 7: fh_be < target ?
+    // Step 8: fh_be < target ?
     bool less = false;
     #pragma unroll
     for(int i=0; i<8; i++){

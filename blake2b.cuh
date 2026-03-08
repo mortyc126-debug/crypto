@@ -149,15 +149,17 @@ __device__ __forceinline__ uint64_t bswap64_inline(uint64_t x) {
             ((x & 0xFF00000000000000ULL) >> 56);
 }
 
-// Hash exactly 32+8=40 bytes (blob_hash[32] || nonce[8]) -> 64 bytes
-// FIX: nonce is stored as big-endian bytes (network order) to match pool verification.
+// Hash exactly 32+8=40 bytes (blob_hash[32] || nonce[8]) -> 32 bytes (Blake2b-256)
+// FIX v0.10: Changed from Blake2b-512 (64 bytes) to Blake2b-256 (32 bytes)
+//            to match Ergo Autolykos v2 specification.
+// FIX v0.7:  nonce is stored as big-endian bytes (network order) to match pool verification.
 __device__ __forceinline__ void blake2b_hash_40(
     const uint64_t* blob_words,  // 4 x uint64 (32 bytes, LE words = natural msg bytes)
     uint64_t nonce,               // nonce as integer; written BE into hash input
-    uint64_t out[8])              // 64 bytes output
+    uint64_t out[4])              // 32 bytes output (Blake2b-256)
 {
     uint64_t h[8];
-    h[0] = 0x6A09E667F3BCC908ULL ^ (0x01010000ULL | 64);
+    h[0] = 0x6A09E667F3BCC908ULL ^ (0x01010000ULL | 32);  // Blake2b-256
     h[1] = 0xBB67AE8584CAA73BULL;
     h[2] = 0x3C6EF372FE94F82BULL;
     h[3] = 0xA54FF53A5F1D36F1ULL;
@@ -171,13 +173,13 @@ __device__ __forceinline__ void blake2b_hash_40(
     // nonce: MUST be byte-swapped so it enters blake2b as big-endian bytes.
     uint64_t m[16] = {
         blob_words[0], blob_words[1], blob_words[2], blob_words[3],
-        bswap64_inline(nonce),  // FIX: was just `nonce` (wrong LE byte order)
+        bswap64_inline(nonce),  // FIX v0.7: was just `nonce` (wrong LE byte order)
         0, 0, 0,
         0, 0, 0, 0,
         0, 0, 0, 0
     };
     blake2b_compress(h, m, 40, 0, true);
-    for(int i=0;i<8;i++) out[i]=h[i];
+    for(int i=0;i<4;i++) out[i]=h[i];
 }
 
 // Hash exactly 31*32=992 bytes (sum of 32 DAG elements) -> 32 bytes output

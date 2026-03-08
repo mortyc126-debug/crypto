@@ -1,5 +1,6 @@
-// ErgoMiner v0.10
-// Fix v0.10: left-align nonce bytes in 8-byte field (nonce_total_size < 8 needs right zero-padding)
+// ErgoMiner v0.11
+// Fix v0.11: Blake2b-256 for seed (was Blake2b-512), add genIndexes second hash,
+//            fix index generation to use contiguous byte sliding window.
 // Fix v0.7: nonce hashed as big-endian bytes to match pool/network verification
 // Fix v0.7: increased GPU occupancy (BLOCKS 112->448) for ~4x hashrate improvement
 #define _WIN32_WINNT 0x0600
@@ -103,11 +104,11 @@ static uint64_t*   d_blob_words = nullptr;
 
 // Debug kernel: verbose intermediate value dump to pinpoint CPU/GPU divergence
 // Output layout (all uint64, 64 elements):
-//   [0..7]   = seed64[0..7]       (blake2b_hash_40 output)
-//   [8..15]  = ext[0..7] as u64   (upper 32 bits of bswap64(seed_word))
+//   [0..3]   = seed[0..3]         (Blake2b256(msg||nonce) output, 32 bytes)
+//   [4..7]   = hash[0..3]         (Blake2b256(seed), genIndexes hash)
+//   [8..11]  = extended[0..3] as bytes packed into u64
 //   [16..19] = idx[0..3] as u64
 //   [20..23] = DAG[idx[0]][0..3] as u64 (raw 32-byte elem, first 4 words)
-//   [24..27] = DAG[idx[0]][4..7] as u64
 //   [28..31] = sum[0..3] as u64 (31-byte sum, packed as LE)
 //   [32..35] = final_hash[0..3] (blake2b-256 of sum)
 //   [36..43] = fh_be[0..7] as u64
@@ -116,36 +117,45 @@ __global__ void debug_one_hash_kernel(
     uint64_t N,
     const uint64_t* __restrict__ blob_words,
     uint64_t nonce,
-    uint64_t* out_debug,  // 64 x uint64
-    int nonce_shift)
+    uint64_t* out_debug)  // 64 x uint64
 {
     if(threadIdx.x != 0 || blockIdx.x != 0) return;
 
-    // Seed
-    // FIX v0.10: left-align nonce bytes in 8-byte field (shift by nonce_shift bits)
-    uint64_t seed64[8];
-    blake2b_hash_40(blob_words, nonce << nonce_shift, seed64);
-    for(int i=0;i<8;i++) out_debug[i]=seed64[i];
+    // Step 1: seed = Blake2b256(msg || nonce_BE)
+    uint64_t seed[4];
+    blake2b_hash_40(blob_words, nonce, seed);
+    for(int i=0;i<4;i++) out_debug[i]=seed[i];
 
-    // ext
-    uint32_t ext[9];
-    for(int i=0;i<8;i++){
-        uint64_t lo=(uint64_t)(uint32_t)seed64[i], hi=(uint64_t)(seed64[i]>>32);
-        uint64_t swapped = (uint64_t)__byte_perm((uint32_t)hi,(uint32_t)lo,0x0123) |
-                           ((uint64_t)__byte_perm((uint32_t)hi,(uint32_t)lo,0x4567)<<32);
-        ext[i]=(uint32_t)(swapped>>32);
-        out_debug[8+i]=(uint64_t)ext[i];
+    // Step 2: hash = Blake2b256(seed)  [genIndexes internal hash]
+    uint64_t hash[4];
+    blake2b_256_32(seed, hash);
+    for(int i=0;i<4;i++) out_debug[4+i]=hash[i];
+
+    // Step 3: Build 35-byte extended hash
+    uint8_t extended[36];
+    for(int i=0;i<4;i++){
+        for(int j=0;j<8;j++)
+            extended[i*8+j] = (uint8_t)(hash[i] >> (j*8));
     }
-    ext[8]=ext[0];
+    extended[32] = extended[0];
+    extended[33] = extended[1];
+    extended[34] = extended[2];
 
-    // idx
+    // Pack first 32 bytes of extended into debug slots
+    for(int i=0;i<4;i++){
+        uint64_t v=0;
+        for(int j=0;j<8;j++) v|=((uint64_t)extended[i*8+j])<<(j*8);
+        out_debug[8+i]=v;
+    }
+
+    // Step 4: Generate 32 indices
     uint32_t idx[32];
-    for(int i=0;i<8;i++){
-        uint32_t hi=ext[i],lo=ext[i+1];
-        idx[i*4+0]=(uint32_t)((uint64_t)hi%N);
-        idx[i*4+1]=(uint32_t)((((uint64_t)hi<<8)|(lo>>24))%N);
-        idx[i*4+2]=(uint32_t)((((uint64_t)hi<<16)|(lo>>16))%N);
-        idx[i*4+3]=(uint32_t)((((uint64_t)hi<<24)|(lo>>8))%N);
+    for(int i=0;i<32;i++){
+        uint32_t v = ((uint32_t)extended[i]   << 24) |
+                     ((uint32_t)extended[i+1] << 16) |
+                     ((uint32_t)extended[i+2] <<  8) |
+                      (uint32_t)extended[i+3];
+        idx[i] = (uint32_t)((uint64_t)v % N);
     }
     for(int i=0;i<4;i++) out_debug[16+i]=(uint64_t)idx[i];
 
@@ -157,8 +167,6 @@ __global__ void debug_one_hash_kernel(
             for(int j=0;j<8;j++) v|=((uint64_t)p[i*8+j])<<(j*8);
             out_debug[20+i]=v;
         }
-        // DAG elements are 32 bytes each — no second word group
-        for(int i=0;i<4;i++) out_debug[24+i]=0;
     }
 
     // Sum
@@ -450,7 +458,7 @@ static void stratum_recv_thread(){
 
 static void stratum_subscribe(){
     char buf[256];
-    snprintf(buf,sizeof(buf),"{\"id\":%d,\"method\":\"mining.subscribe\",\"params\":[\"ergominer/0.10\"]}",g_msg_id.fetch_add(1));
+    snprintf(buf,sizeof(buf),"{\"id\":%d,\"method\":\"mining.subscribe\",\"params\":[\"ergominer/0.11\"]}",g_msg_id.fetch_add(1));
     send_line(buf);
 }
 static void stratum_authorize(){
@@ -585,9 +593,8 @@ static void gpu_mine_loop(){
             CUDA_CHECK(cudaMalloc(&d_dbg, 64*sizeof(uint64_t)));
             cudaMemset(d_dbg, 0, 64*sizeof(uint64_t));
 
-            int dbg_nonce_shift = (8 - g_nonce_total_size) * 8;
-            LOG("[DEBUG] Verbose GPU debug for nonce=%016llx (shift=%d)\n",(unsigned long long)nonce_start,dbg_nonce_shift);
-            debug_one_hash_kernel<<<1,1>>>(d_dag,dag_N,d_blob_words,nonce_start,d_dbg,dbg_nonce_shift);
+            LOG("[DEBUG] Verbose GPU debug for nonce=%016llx\n",(unsigned long long)nonce_start);
+            debug_one_hash_kernel<<<1,1>>>(d_dag,dag_N,d_blob_words,nonce_start,d_dbg);
             cudaDeviceSynchronize();
             uint64_t dbg[64]={};
             cudaMemcpy(dbg,d_dbg,64*sizeof(uint64_t),cudaMemcpyDeviceToHost);
@@ -596,9 +603,12 @@ static void gpu_mine_loop(){
             LOG("[DEBUG] GPU seed[0:4]:   %016llx %016llx %016llx %016llx\n",
                 (unsigned long long)dbg[0],(unsigned long long)dbg[1],
                 (unsigned long long)dbg[2],(unsigned long long)dbg[3]);
-            LOG("[DEBUG] GPU ext[0:4]:    %08x %08x %08x %08x\n",
-                (unsigned)(dbg[8]),(unsigned)(dbg[9]),
-                (unsigned)(dbg[10]),(unsigned)(dbg[11]));
+            LOG("[DEBUG] GPU hash[0:4]:   %016llx %016llx %016llx %016llx\n",
+                (unsigned long long)dbg[4],(unsigned long long)dbg[5],
+                (unsigned long long)dbg[6],(unsigned long long)dbg[7]);
+            LOG("[DEBUG] GPU ext[0:4]:    %016llx %016llx %016llx %016llx\n",
+                (unsigned long long)dbg[8],(unsigned long long)dbg[9],
+                (unsigned long long)dbg[10],(unsigned long long)dbg[11]);
             LOG("[DEBUG] GPU idx[0:4]:    %u %u %u %u\n",
                 (unsigned)(dbg[16]),(unsigned)(dbg[17]),
                 (unsigned)(dbg[18]),(unsigned)(dbg[19]));
@@ -622,8 +632,7 @@ static void gpu_mine_loop(){
         MineResult zero={0,false,{}};
         CUDA_CHECK(cudaMemcpy(d_result,&zero,sizeof(zero),cudaMemcpyHostToDevice));
 
-        int nonce_shift = (8 - g_nonce_total_size) * 8;
-        mine_kernel<<<BLOCKS,THREADS>>>(d_dag,dag_N,d_blob_words,nonce_start,BATCH,d_target,d_result,nonce_shift);
+        mine_kernel<<<BLOCKS,THREADS>>>(d_dag,dag_N,d_blob_words,nonce_start,BATCH,d_target,d_result);
 
         if(cudaGetLastError()!=cudaSuccess||cudaDeviceSynchronize()!=cudaSuccess){
             LOG("[GPU] Kernel error iter=%d\n",iter); Sleep(1000); continue;
@@ -684,10 +693,10 @@ static void hashrate_thread(){
 
 int main(){
     srand((unsigned)time(nullptr));
-    LOG("=== ErgoMiner v0.10 ===\n");
-    LOG("[FIX] nonce bytes left-aligned in 8-byte field (right zero-padded for nonce_total < 8)\n");
+    LOG("=== ErgoMiner v0.11 ===\n");
+    LOG("[FIX] Blake2b-256 for seed hash (was Blake2b-512)\n");
+    LOG("[FIX] genIndexes: added second Blake2b-256 + contiguous byte sliding window\n");
     LOG("[FIX] nonce hashed as big-endian bytes (matches pool verification)\n");
-    LOG("[FIX] increased GPU batch size for better hashrate\n");
     WSADATA wsa; WSAStartup(MAKEWORD(2,2),&wsa);
     CUDA_CHECK(cudaSetDevice(0));
     cudaDeviceProp prop; cudaGetDeviceProperties(&prop,0);
