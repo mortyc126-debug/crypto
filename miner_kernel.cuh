@@ -13,22 +13,22 @@ __device__ __forceinline__ void load_dag_element(
     uint32_t idx,
     uint8_t* elem)
 {
-    const uint8_t* p = dag + (uint64_t)idx * 32 + 1;
+    const uint8_t* p = dag + (uint64_t)idx * 32;
     #pragma unroll
-    for(int j=0;j<31;j++) elem[j] = p[j];
+    for(int j=0;j<32;j++) elem[j] = p[j];
 }
 
-__device__ __forceinline__ void add248(uint8_t* __restrict__ a, const uint8_t* __restrict__ b) {
+__device__ __forceinline__ void add256(uint8_t* __restrict__ a, const uint8_t* __restrict__ b) {
     uint32_t carry = 0;
     #pragma unroll
-    for(int i=30; i>=0; i--){
+    for(int i=31; i>=0; i--){
         uint32_t s = (uint32_t)a[i] + b[i] + carry;
         a[i] = (uint8_t)s;
         carry = s >> 8;
     }
 }
 
-__device__ __forceinline__ void blake2b_hash_31(const uint8_t* in, uint64_t out[4]) {
+__device__ __forceinline__ void blake2b_hash_32(const uint8_t* in, uint64_t out[4]) {
     uint64_t h[8];
     h[0] = 0x6A09E667F3BCC908ULL ^ (0x01010000ULL | 32);
     h[1] = 0xBB67AE8584CAA73BULL;
@@ -40,9 +40,9 @@ __device__ __forceinline__ void blake2b_hash_31(const uint8_t* in, uint64_t out[
     h[7] = 0x5BE0CD19137E2179ULL;
     uint64_t m[16] = {};
     #pragma unroll
-    for(int i=0; i<31; i++)
+    for(int i=0; i<32; i++)
         m[i/8] |= ((uint64_t)in[i]) << ((i%8)*8);
-    blake2b_compress(h, m, 31ULL, 0ULL, true);
+    blake2b_compress(h, m, 32ULL, 0ULL, true);
     out[0]=h[0]; out[1]=h[1]; out[2]=h[2]; out[3]=h[3];
 }
 
@@ -111,18 +111,18 @@ __global__ void mine_kernel(
         idx[i] = (uint32_t)((uint64_t)v % N);
     }
 
-    // Step 5: Sum 32 DAG elements (31-byte big-endian addition)
-    uint8_t sum[31] = {};
-    uint8_t elem[31];
+    // Step 5: Sum 32 DAG elements (32-byte / 256-bit big-endian addition)
+    uint8_t sum[32] = {};
+    uint8_t elem[32];
     #pragma unroll 4
     for(int k=0; k<32; k++){
         load_dag_element(dag, idx[k], elem);
-        add248(sum, elem);
+        add256(sum, elem);
     }
 
-    // Step 6: Final hash = Blake2b256(sum[31])
+    // Step 6: Final hash = Blake2b256(sum[32])
     uint64_t final_hash[4];
-    blake2b_hash_31(sum, final_hash);
+    blake2b_hash_32(sum, final_hash);
 
     // Step 7: Convert to big-endian uint32 words for comparison
     uint32_t fh_be[8];
