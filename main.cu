@@ -19,6 +19,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <unordered_set>
 
 #define LOG(...) do { printf(__VA_ARGS__); fflush(stdout); } while(0)
 #define CUDA_CHECK(call) do { \
@@ -207,6 +208,8 @@ static std::atomic<uint64_t> g_hash_count{0};
 static std::atomic<bool>     g_running{true};
 static std::atomic<int>      g_accepted{0};
 static std::atomic<int>      g_rejected{0};
+static std::unordered_set<int> g_pending_submits;
+static std::mutex              g_pending_mutex;
 
 static SOCKET     g_sock=INVALID_SOCKET;
 static std::mutex g_sock_mutex;
@@ -423,14 +426,20 @@ static void stratum_recv_thread(){
                                || line.find("\"error\"")==std::string::npos;
                 if(has_result && error_ok) parse_subscribe_response(line);
             }
+            bool is_submit = false;
+            { std::lock_guard<std::mutex> lk(g_pending_mutex);
+              auto it = g_pending_submits.find(id);
+              if(it != g_pending_submits.end()){ is_submit = true; g_pending_submits.erase(it); }
+            }
             if(line.find("\"result\":true")!=std::string::npos){
-                if(id<=2) LOG("[STRATUM] OK\n");
-                else LOG("[POOL] ACCEPTED (+%d)\n",++g_accepted);
+                if(is_submit) LOG("[POOL] ACCEPTED (+%d)\n",++g_accepted);
+                else if(id<=2) LOG("[STRATUM] OK\n");
+                // else: keepalive/extranonce ack — ignore silently
             }
             else if(line.find("\"result\":false")!=std::string::npos ||
                     line.find("\"error\":[")!=std::string::npos){
-                if(id<=2) LOG("[STRATUM] FAIL: %s\n",line.c_str());
-                else{g_rejected++;LOG("[POOL] REJECTED: %s\n",line.c_str());}
+                if(is_submit){ g_rejected++; LOG("[POOL] REJECTED: %s\n",line.c_str()); }
+                else if(id<=2) LOG("[STRATUM] FAIL: %s\n",line.c_str());
             }
         }
     }
@@ -463,10 +472,13 @@ static void stratum_submit(const std::string& job_id, uint64_t nonce_found){
     // Full nonce = en1 + en2 (total nonce_total_size bytes = nonce_total_size*2 hex chars)
     std::string full_nonce = g_extranonce1 + std::string(en2_hex);
 
+    int sid = g_msg_id.fetch_add(1);
+    { std::lock_guard<std::mutex> lk(g_pending_mutex); g_pending_submits.insert(sid); }
+
     char buf[1024];
     std::string u = std::string(WALLET_ADDR) + "." + WORKER_NAME;
     snprintf(buf, sizeof(buf), "{\"id\":%d,\"method\":\"mining.submit\",\"params\":[\"%s\",\"%s\",\"%s\"]}",
-        g_msg_id.fetch_add(1), u.c_str(), job_id.c_str(), full_nonce.c_str());
+        sid, u.c_str(), job_id.c_str(), full_nonce.c_str());
     send_line(buf);
 
     LOG("[SUBMIT] job=%s nonce=%016llx en1=%s en2=%s full=%s\n",
@@ -695,6 +707,7 @@ int main(){
         g_extranonce2_size = 4;
         g_nonce_total_size = 6;
         { std::lock_guard<std::mutex> lk(g_job_mutex); g_job = Job{}; }
+        { std::lock_guard<std::mutex> lk(g_pending_mutex); g_pending_submits.clear(); }
 
         stratum_subscribe(); Sleep(300); stratum_authorize();
         std::thread(stratum_recv_thread).detach();
