@@ -224,7 +224,7 @@ static bool send_line(const std::string& line){
     std::string msg=line+"\n";
     std::lock_guard<std::mutex> lock(g_sock_mutex);
     int r=send(g_sock,msg.c_str(),(int)msg.size(),0);
-    if(r<=0){ LOG("[NET] send failed (line=%s)\n",line.substr(0,60).c_str()); return false; }
+    if(r!=(int)msg.size()){ LOG("[NET] send failed (sent %d/%d, line=%s)\n",r,(int)msg.size(),line.substr(0,60).c_str()); return false; }
     LOG("[SEND] %s\n",line.c_str());
     return true;
 }
@@ -237,8 +237,12 @@ static bool stratum_connect(){
     hints.ai_family=AF_INET; hints.ai_socktype=SOCK_STREAM;
     if(getaddrinfo(POOL_HOST,POOL_PORT,&hints,&res)!=0) return false;
     g_sock=socket(res->ai_family,res->ai_socktype,res->ai_protocol);
+    if(g_sock==INVALID_SOCKET){freeaddrinfo(res);return false;}
     DWORD to=120000; setsockopt(g_sock,SOL_SOCKET,SO_RCVTIMEO,(char*)&to,sizeof(to));
-    if(connect(g_sock,res->ai_addr,(int)res->ai_addrlen)!=0){freeaddrinfo(res);return false;}
+    if(connect(g_sock,res->ai_addr,(int)res->ai_addrlen)!=0){
+        closesocket(g_sock); g_sock=INVALID_SOCKET;
+        freeaddrinfo(res); return false;
+    }
     freeaddrinfo(res);
     LOG("[NET] Connected to %s:%s\n",POOL_HOST,POOL_PORT);
     return true;
@@ -263,9 +267,15 @@ static void parse_subscribe_response(const std::string& line) {
                     size_t after = end+1;
                     while(after < sub.size() && (sub[after]==',' || sub[after]==' ')) after++;
                     if(after < sub.size() && isdigit(sub[after])) {
-                        g_nonce_total_size = atoi(sub.c_str()+after);
-                        g_extranonce2_size = g_nonce_total_size - en1_bytes;
-                        if(g_extranonce2_size < 1) g_extranonce2_size = 4;
+                        char* endp;
+                        long val = strtol(sub.c_str()+after, &endp, 10);
+                        if(endp == sub.c_str()+after || val < 2 || val > 16) {
+                            LOG("[STRATUM] Invalid nonce_total_size from pool, using defaults\n");
+                        } else {
+                            g_nonce_total_size = (int)val;
+                            g_extranonce2_size = g_nonce_total_size - en1_bytes;
+                            if(g_extranonce2_size < 1) g_extranonce2_size = 4;
+                        }
                         LOG("[STRATUM] extranonce1=%s (%d bytes), nonce_total=%d, extranonce2_size=%d\n",
                             g_extranonce1.c_str(), en1_bytes, g_nonce_total_size, g_extranonce2_size);
                     }
@@ -280,6 +290,7 @@ static void parse_subscribe_response(const std::string& line) {
 }
 
 static uint32_t g_share_target[8]={0x00200000,0,0,0,0,0,0,0};
+static std::mutex g_target_mutex;
 static uint32_t g_network_b[8]={0x00000000,0x3f000000,0x03f00000,0x003f0000,
                                   0x0003f000,0x00003f00,0x000003f0,0x0000003f};
 static bool   g_network_b_set = false;
@@ -305,17 +316,18 @@ static void parse_decimal_bignum(const char* s, uint32_t out[8]){
 static void set_difficulty(double diff){
     if(diff<=0) diff=1.0;
     g_current_diff = diff;
-    memset(g_share_target, 0, sizeof(g_share_target));
     uint64_t d = (uint64_t)(diff + 0.5);
     if(d < 1) d = 1;
+    uint32_t tmp[8];
     uint64_t rem = 0;
     for(int i = 0; i < 8; i++){
         uint64_t cur = (rem << 32) | (uint64_t)g_network_b[i];
-        g_share_target[i] = (uint32_t)(cur / d);
+        tmp[i] = (uint32_t)(cur / d);
         rem = cur % d;
     }
+    { std::lock_guard<std::mutex> lk(g_target_mutex); memcpy(g_share_target, tmp, 32); }
     LOG("[DIFF] difficulty=%.4f -> share_target=%08x %08x %08x\n",
-        diff, g_share_target[0], g_share_target[1], g_share_target[2]);
+        diff, tmp[0], tmp[1], tmp[2]);
 }
 
 static void parse_notify(const std::string& line){
@@ -326,7 +338,7 @@ static void parse_notify(const std::string& line){
 
     Job job; job.job_id=p[0]; job.height=0; job.nonce_prefix=0;
     memset(job.msg,0,32);
-    memcpy(job.target, g_share_target, 32);
+    { std::lock_guard<std::mutex> lk(g_target_mutex); memcpy(job.target, g_share_target, 32); }
 
     bool got_msg=false, clean=false;
 
@@ -365,14 +377,15 @@ static void parse_notify(const std::string& line){
                     g_network_b[0], g_network_b[1], g_network_b[2]);
                 double d_cur = g_current_diff > 0 ? g_current_diff : 1.0;
                 uint64_t d = (uint64_t)(d_cur + 0.5); if(d<1) d=1;
-                uint64_t rem = 0;
+                uint32_t tmp2[8]; uint64_t rem = 0;
                 for(int w=0;w<8;w++){
                     uint64_t cur=(rem<<32)|(uint64_t)g_network_b[w];
-                    g_share_target[w]=(uint32_t)(cur/d);
+                    tmp2[w]=(uint32_t)(cur/d);
                     rem=cur%d;
                 }
+                { std::lock_guard<std::mutex> lk(g_target_mutex); memcpy(g_share_target, tmp2, 32); }
                 LOG("[DIFF] recalc after b update -> share_target=%08x %08x %08x\n",
-                    g_share_target[0],g_share_target[1],g_share_target[2]);
+                    tmp2[0],tmp2[1],tmp2[2]);
             }
             continue;
         }
@@ -405,8 +418,10 @@ static void stratum_recv_thread(){
         }
         else if(id>0){
             if(id==1) {
-                if(line.find("\"result\":")!=std::string::npos && line.find("\"error\":null")!=std::string::npos)
-                    parse_subscribe_response(line);
+                bool has_result = line.find("\"result\":")!=std::string::npos;
+                bool error_ok   = line.find("\"error\":null")!=std::string::npos
+                               || line.find("\"error\"")==std::string::npos;
+                if(has_result && error_ok) parse_subscribe_response(line);
             }
             if(line.find("\"result\":true")!=std::string::npos){
                 if(id<=2) LOG("[STRATUM] OK\n");
@@ -422,14 +437,14 @@ static void stratum_recv_thread(){
 }
 
 static void stratum_subscribe(){
-    char buf[200];
-    sprintf(buf,"{\"id\":%d,\"method\":\"mining.subscribe\",\"params\":[\"ergominer/0.9\"]}",g_msg_id++);
+    char buf[256];
+    snprintf(buf,sizeof(buf),"{\"id\":%d,\"method\":\"mining.subscribe\",\"params\":[\"ergominer/0.9\"]}",g_msg_id.fetch_add(1));
     send_line(buf);
 }
 static void stratum_authorize(){
-    char buf[512];
+    char buf[768];
     std::string u=std::string(WALLET_ADDR)+"."+WORKER_NAME;
-    sprintf(buf,"{\"id\":%d,\"method\":\"mining.authorize\",\"params\":[\"%s\",\"x\"]}",g_msg_id++,u.c_str());
+    snprintf(buf,sizeof(buf),"{\"id\":%d,\"method\":\"mining.authorize\",\"params\":[\"%s\",\"x\"]}",g_msg_id.fetch_add(1),u.c_str());
     send_line(buf);
 }
 
@@ -448,10 +463,10 @@ static void stratum_submit(const std::string& job_id, uint64_t nonce_found){
     // Full nonce = en1 + en2 (total nonce_total_size bytes = nonce_total_size*2 hex chars)
     std::string full_nonce = g_extranonce1 + std::string(en2_hex);
 
-    char buf[512];
+    char buf[1024];
     std::string u = std::string(WALLET_ADDR) + "." + WORKER_NAME;
-    sprintf(buf, "{\"id\":%d,\"method\":\"mining.submit\",\"params\":[\"%s\",\"%s\",\"%s\"]}",
-        g_msg_id++, u.c_str(), job_id.c_str(), full_nonce.c_str());
+    snprintf(buf, sizeof(buf), "{\"id\":%d,\"method\":\"mining.submit\",\"params\":[\"%s\",\"%s\",\"%s\"]}",
+        g_msg_id.fetch_add(1), u.c_str(), job_id.c_str(), full_nonce.c_str());
     send_line(buf);
 
     LOG("[SUBMIT] job=%s nonce=%016llx en1=%s en2=%s full=%s\n",
@@ -467,7 +482,7 @@ __global__ void dag_selftest_kernel(const uint8_t* __restrict__ dag, uint8_t* ou
 
 static void dag_selftest(const uint8_t* d_dag, uint64_t height) {
     uint8_t* d_out = nullptr;
-    cudaMalloc(&d_out, 64);
+    CUDA_CHECK(cudaMalloc(&d_out, 64));
     dag_selftest_kernel<<<1,1>>>(d_dag, d_out);
     cudaDeviceSynchronize();
     uint8_t out[64];
@@ -539,16 +554,20 @@ static void gpu_mine_loop(){
             sscanf(g_extranonce1.c_str()+i, "%02x", &b);
             en1_val = (en1_val << 8) | b;
         }
-        uint64_t nonce_start = (en1_val << ((uint64_t)g_extranonce2_size * 8)) | (uint64_t)ctr;
+        int shift_bits = g_extranonce2_size * 8;
+        uint64_t nonce_start = (shift_bits > 0 && shift_bits < 64)
+            ? ((en1_val << shift_bits) | (uint64_t)ctr)
+            : (uint64_t)ctr;
 
         uint64_t bw[4]; memcpy(bw,cur.msg,32);
         CUDA_CHECK(cudaMemcpy(d_blob_words,bw,32,cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_target,g_share_target,32,cudaMemcpyHostToDevice));
+        { std::lock_guard<std::mutex> lk(g_target_mutex);
+          CUDA_CHECK(cudaMemcpy(d_target,g_share_target,32,cudaMemcpyHostToDevice)); }
 
         // First iteration: verbose debug to compare CPU vs GPU intermediate values
         if(iter==1){
             uint64_t* d_dbg=nullptr;
-            cudaMalloc(&d_dbg, 64*sizeof(uint64_t));
+            CUDA_CHECK(cudaMalloc(&d_dbg, 64*sizeof(uint64_t)));
             cudaMemset(d_dbg, 0, 64*sizeof(uint64_t));
 
             LOG("[DEBUG] Verbose GPU debug for nonce=%016llx\n",(unsigned long long)nonce_start);
@@ -601,7 +620,7 @@ static void gpu_mine_loop(){
             LOG("[FOUND] nonce=%016llx  hash=%08x%08x%08x%08x...\n",
                 (unsigned long long)res.nonce,res.fh_be[0],res.fh_be[1],res.fh_be[2],res.fh_be[3]);
             DWORD now = GetTickCount();
-            if(now - g_submit_window_start > 1000) {
+            if(now - g_submit_window_start >= 1000) {
                 g_submit_window_start = now;
                 g_submit_count.store(0);
             }
@@ -629,8 +648,8 @@ static void keepalive_thread(){
         if(!g_running) break;
         if(g_sock==INVALID_SOCKET) continue;
         // Send keepalive as mining.extranonce.subscribe (harmless no-op)
-        char buf[100];
-        sprintf(buf,"{\"id\":%d,\"method\":\"mining.extranonce.subscribe\",\"params\":[]}",g_msg_id.fetch_add(1));
+        char buf[256];
+        snprintf(buf,sizeof(buf),"{\"id\":%d,\"method\":\"mining.extranonce.subscribe\",\"params\":[]}",g_msg_id.fetch_add(1));
         send_line(buf);
     }
 }
