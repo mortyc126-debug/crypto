@@ -1,6 +1,7 @@
-// ErgoMiner v0.9
-// Fix: nonce hashed as big-endian bytes to match pool/network verification
-// Fix: increased GPU occupancy (BLOCKS 112->448) for ~4x hashrate improvement
+// ErgoMiner v0.10
+// Fix v0.10: left-align nonce bytes in 8-byte field (nonce_total_size < 8 needs right zero-padding)
+// Fix v0.7: nonce hashed as big-endian bytes to match pool/network verification
+// Fix v0.7: increased GPU occupancy (BLOCKS 112->448) for ~4x hashrate improvement
 #define _WIN32_WINNT 0x0600
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -115,13 +116,15 @@ __global__ void debug_one_hash_kernel(
     uint64_t N,
     const uint64_t* __restrict__ blob_words,
     uint64_t nonce,
-    uint64_t* out_debug)  // 64 x uint64
+    uint64_t* out_debug,  // 64 x uint64
+    int nonce_shift)
 {
     if(threadIdx.x != 0 || blockIdx.x != 0) return;
 
     // Seed
+    // FIX v0.10: left-align nonce bytes in 8-byte field (shift by nonce_shift bits)
     uint64_t seed64[8];
-    blake2b_hash_40(blob_words, nonce, seed64);
+    blake2b_hash_40(blob_words, nonce << nonce_shift, seed64);
     for(int i=0;i<8;i++) out_debug[i]=seed64[i];
 
     // ext
@@ -447,7 +450,7 @@ static void stratum_recv_thread(){
 
 static void stratum_subscribe(){
     char buf[256];
-    snprintf(buf,sizeof(buf),"{\"id\":%d,\"method\":\"mining.subscribe\",\"params\":[\"ergominer/0.9\"]}",g_msg_id.fetch_add(1));
+    snprintf(buf,sizeof(buf),"{\"id\":%d,\"method\":\"mining.subscribe\",\"params\":[\"ergominer/0.10\"]}",g_msg_id.fetch_add(1));
     send_line(buf);
 }
 static void stratum_authorize(){
@@ -582,8 +585,9 @@ static void gpu_mine_loop(){
             CUDA_CHECK(cudaMalloc(&d_dbg, 64*sizeof(uint64_t)));
             cudaMemset(d_dbg, 0, 64*sizeof(uint64_t));
 
-            LOG("[DEBUG] Verbose GPU debug for nonce=%016llx\n",(unsigned long long)nonce_start);
-            debug_one_hash_kernel<<<1,1>>>(d_dag,dag_N,d_blob_words,nonce_start,d_dbg);
+            int dbg_nonce_shift = (8 - g_nonce_total_size) * 8;
+            LOG("[DEBUG] Verbose GPU debug for nonce=%016llx (shift=%d)\n",(unsigned long long)nonce_start,dbg_nonce_shift);
+            debug_one_hash_kernel<<<1,1>>>(d_dag,dag_N,d_blob_words,nonce_start,d_dbg,dbg_nonce_shift);
             cudaDeviceSynchronize();
             uint64_t dbg[64]={};
             cudaMemcpy(dbg,d_dbg,64*sizeof(uint64_t),cudaMemcpyDeviceToHost);
@@ -618,7 +622,8 @@ static void gpu_mine_loop(){
         MineResult zero={0,false,{}};
         CUDA_CHECK(cudaMemcpy(d_result,&zero,sizeof(zero),cudaMemcpyHostToDevice));
 
-        mine_kernel<<<BLOCKS,THREADS>>>(d_dag,dag_N,d_blob_words,nonce_start,BATCH,d_target,d_result);
+        int nonce_shift = (8 - g_nonce_total_size) * 8;
+        mine_kernel<<<BLOCKS,THREADS>>>(d_dag,dag_N,d_blob_words,nonce_start,BATCH,d_target,d_result,nonce_shift);
 
         if(cudaGetLastError()!=cudaSuccess||cudaDeviceSynchronize()!=cudaSuccess){
             LOG("[GPU] Kernel error iter=%d\n",iter); Sleep(1000); continue;
@@ -679,7 +684,8 @@ static void hashrate_thread(){
 
 int main(){
     srand((unsigned)time(nullptr));
-    LOG("=== ErgoMiner v0.9 ===\n");
+    LOG("=== ErgoMiner v0.10 ===\n");
+    LOG("[FIX] nonce bytes left-aligned in 8-byte field (right zero-padded for nonce_total < 8)\n");
     LOG("[FIX] nonce hashed as big-endian bytes (matches pool verification)\n");
     LOG("[FIX] increased GPU batch size for better hashrate\n");
     WSADATA wsa; WSAStartup(MAKEWORD(2,2),&wsa);
