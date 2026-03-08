@@ -57,7 +57,8 @@ __global__ void mine_kernel(
     uint64_t nonce_start,
     uint32_t batch_size,
     const uint32_t* __restrict__ target,
-    MineResult* result)
+    MineResult* result,
+    int nonce_shift)
 {
     uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if(tid >= batch_size) return;
@@ -67,8 +68,12 @@ __global__ void mine_kernel(
 
     // Step 1: seed = Blake2b_64(blob[32] || nonce_BE[8])
     // FIX v0.7: nonce is now hashed as big-endian bytes (see blake2b_hash_40)
+    // FIX v0.10: left-align nonce bytes in 8-byte field to match pool verification.
+    // Pool nonce_total_size may be < 8 bytes; the nonce bytes occupy the HIGH bytes
+    // of the 8-byte field with zero padding on the right.
+    // e.g. 6-byte nonce "dd232a59ca5a" -> bytes dd 23 2a 59 ca 5a 00 00
     uint64_t seed64[8];
-    blake2b_hash_40(blob_words, nonce, seed64);
+    blake2b_hash_40(blob_words, nonce << nonce_shift, seed64);
 
     // Step 2: extendedHash - take high 32 bits of each bswap'd seed word
     uint32_t ext[9];
