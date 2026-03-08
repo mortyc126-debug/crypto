@@ -1,4 +1,7 @@
-// ErgoMiner v0.11
+// ErgoMiner v0.12
+// Fix v0.12: Sum 32 DAG elements as 256-bit (32 bytes), not 248-bit (31 bytes).
+//            The carry into the high byte was lost, causing wrong final hash.
+//            Also hash 32-byte sum (was hashing only 31 bytes).
 // Fix v0.11: Blake2b-256 for seed (was Blake2b-512), add genIndexes second hash,
 //            fix index generation to use contiguous byte sliding window.
 // Fix v0.7: nonce hashed as big-endian bytes to match pool/network verification
@@ -109,7 +112,7 @@ static uint64_t*   d_blob_words = nullptr;
 //   [8..11]  = extended[0..3] as bytes packed into u64
 //   [16..19] = idx[0..3] as u64
 //   [20..23] = DAG[idx[0]][0..3] as u64 (raw 32-byte elem, first 4 words)
-//   [28..31] = sum[0..3] as u64 (31-byte sum, packed as LE)
+//   [28..31] = sum[0..3] as u64 (32-byte sum, packed as LE)
 //   [32..35] = final_hash[0..3] (blake2b-256 of sum)
 //   [36..43] = fh_be[0..7] as u64
 __global__ void debug_one_hash_kernel(
@@ -169,27 +172,25 @@ __global__ void debug_one_hash_kernel(
         }
     }
 
-    // Sum
-    uint8_t sum[31]={};
+    // Sum (32-byte / 256-bit big-endian addition)
+    uint8_t sum[32]={};
     for(int k=0;k<32;k++){
-        const uint8_t* p=dag+(uint64_t)idx[k]*32+1;
+        const uint8_t* p=dag+(uint64_t)idx[k]*32;
         uint32_t carry=0;
-        for(int j=30;j>=0;j--){uint32_t s=(uint32_t)sum[j]+p[j]+carry;sum[j]=(uint8_t)s;carry=s>>8;}
+        for(int j=31;j>=0;j--){uint32_t s=(uint32_t)sum[j]+p[j]+carry;sum[j]=(uint8_t)s;carry=s>>8;}
     }
     // Pack sum as LE uint64 words
     {
-        uint64_t w=0; int wb=0;
-        int wi=28;
-        for(int i=0;i<31;i++){
-            w|=((uint64_t)sum[i])<<(wb*8); wb++;
-            if(wb==8){out_debug[wi++]=w;w=0;wb=0;}
+        for(int i=0;i<4;i++){
+            uint64_t v=0;
+            for(int j=0;j<8;j++) v|=((uint64_t)sum[i*8+j])<<(j*8);
+            out_debug[28+i]=v;
         }
-        if(wb) out_debug[wi]=w;
     }
 
     // Final hash
     uint64_t fh[4];
-    blake2b_hash_31(sum, fh);
+    blake2b_hash_32(sum, fh);
     for(int i=0;i<4;i++) out_debug[32+i]=fh[i];
 
     // fh_be
@@ -458,7 +459,7 @@ static void stratum_recv_thread(){
 
 static void stratum_subscribe(){
     char buf[256];
-    snprintf(buf,sizeof(buf),"{\"id\":%d,\"method\":\"mining.subscribe\",\"params\":[\"ergominer/0.11\"]}",g_msg_id.fetch_add(1));
+    snprintf(buf,sizeof(buf),"{\"id\":%d,\"method\":\"mining.subscribe\",\"params\":[\"ergominer/0.12\"]}",g_msg_id.fetch_add(1));
     send_line(buf);
 }
 static void stratum_authorize(){
@@ -693,9 +694,9 @@ static void hashrate_thread(){
 
 int main(){
     srand((unsigned)time(nullptr));
-    LOG("=== ErgoMiner v0.11 ===\n");
-    LOG("[FIX] Blake2b-256 for seed hash (was Blake2b-512)\n");
-    LOG("[FIX] genIndexes: added second Blake2b-256 + contiguous byte sliding window\n");
+    LOG("=== ErgoMiner v0.12 ===\n");
+    LOG("[FIX] 256-bit (32-byte) DAG element sum + 32-byte final hash input\n");
+    LOG("[FIX] Blake2b-256 for seed hash, genIndexes double-hash, contiguous sliding window\n");
     LOG("[FIX] nonce hashed as big-endian bytes (matches pool verification)\n");
     WSADATA wsa; WSAStartup(MAKEWORD(2,2),&wsa);
     CUDA_CHECK(cudaSetDevice(0));
