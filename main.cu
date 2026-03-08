@@ -153,12 +153,8 @@ __global__ void debug_one_hash_kernel(
             for(int j=0;j<8;j++) v|=((uint64_t)p[i*8+j])<<(j*8);
             out_debug[20+i]=v;
         }
-        // Also store DAG[idx[0]] bytes 4..7 (second word group)
-        for(int i=0;i<4;i++){
-            uint64_t v=0;
-            for(int j=0;j<8;j++) v|=((uint64_t)p[32+i*8+j])<<(j*8);
-            out_debug[24+i]=0; // only 32 bytes per elem
-        }
+        // DAG elements are 32 bytes each — no second word group
+        for(int i=0;i<4;i++) out_debug[24+i]=0;
     }
 
     // Sum
@@ -214,7 +210,7 @@ static std::atomic<int>      g_rejected{0};
 
 static SOCKET     g_sock=INVALID_SOCKET;
 static std::mutex g_sock_mutex;
-static int        g_msg_id=1;
+static std::atomic<int> g_msg_id{1};
 static const char* POOL_HOST   = "erg.2miners.com";
 static const char* POOL_PORT   = "8888";
 static const char* WALLET_ADDR = "9gh3EZ1ETq8NWQjBBnxk5vFpYz48mGH46gboa6fxMjqgwKucwL5";
@@ -227,7 +223,8 @@ static int         g_nonce_total_size = 6;
 static bool send_line(const std::string& line){
     std::string msg=line+"\n";
     std::lock_guard<std::mutex> lock(g_sock_mutex);
-    send(g_sock,msg.c_str(),(int)msg.size(),0);
+    int r=send(g_sock,msg.c_str(),(int)msg.size(),0);
+    if(r<=0){ LOG("[NET] send failed (line=%s)\n",line.substr(0,60).c_str()); return false; }
     LOG("[SEND] %s\n",line.c_str());
     return true;
 }
@@ -633,10 +630,8 @@ static void keepalive_thread(){
         if(g_sock==INVALID_SOCKET) continue;
         // Send keepalive as mining.extranonce.subscribe (harmless no-op)
         char buf[100];
-        sprintf(buf,"{\"id\":%d,\"method\":\"mining.extranonce.subscribe\",\"params\":[]}",g_msg_id++);
-        std::lock_guard<std::mutex> lock(g_sock_mutex);
-        std::string msg=std::string(buf)+"\n";
-        send(g_sock,msg.c_str(),(int)msg.size(),0);
+        sprintf(buf,"{\"id\":%d,\"method\":\"mining.extranonce.subscribe\",\"params\":[]}",g_msg_id.fetch_add(1));
+        send_line(buf);
     }
 }
 
@@ -685,8 +680,13 @@ int main(){
         stratum_subscribe(); Sleep(300); stratum_authorize();
         std::thread(stratum_recv_thread).detach();
 
-        for(int i=0;i<150&&!g_job.valid&&g_running;i++) Sleep(100);
-        if(!g_job.valid){
+        for(int i=0;i<150&&g_running;i++){
+            { std::lock_guard<std::mutex> lk(g_job_mutex); if(g_job.valid) break; }
+            Sleep(100);
+        }
+        bool have_initial_job;
+        { std::lock_guard<std::mutex> lk(g_job_mutex); have_initial_job=g_job.valid; }
+        if(!have_initial_job){
             LOG("[MAIN] No job received, reconnecting...\n");
             g_running.store(false);
             Sleep(5000);
