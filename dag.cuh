@@ -12,7 +12,7 @@ inline uint64_t autolykos_n(uint64_t height) {
     uint64_t epoch = (height - AUTOLYKOS_START) / AUTOLYKOS_PERIOD;
     uint64_t N = AUTOLYKOS_N0;
     for(uint64_t e = 0; e < epoch; e++) {
-        N = (uint64_t)((double)N * 1.05);
+        N = N + N / 20;  // integer *1.05, no float drift
         if(N >= AUTOLYKOS_MAX_N) return AUTOLYKOS_MAX_N;
     }
     return N;
