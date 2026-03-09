@@ -113,17 +113,7 @@ static std::string bytes2hex(const uint8_t* bytes,int len){
 
 static uint8_t*    d_dag        = nullptr;
 static uint64_t    dag_N        = 0;
-static uint64_t    dag_height   = 0;  // epoch height DAG was built for
-
-// Ergo Autolykos v2: DAG elements embed epoch_height, not exact block height.
-// The pool validates shares using the same epoch_height formula.
-static uint64_t ergo_epoch_height(uint64_t block_height) {
-    const uint64_t EPOCH_START  = 614400ULL;
-    const uint64_t EPOCH_PERIOD = 51200ULL;
-    if (block_height < EPOCH_START) return 0;
-    uint64_t epoch = (block_height - EPOCH_START) / EPOCH_PERIOD;
-    return EPOCH_START + epoch * EPOCH_PERIOD;
-}
+static uint64_t    dag_height   = 0;  // block height DAG was built for
 static MineResult* d_result     = nullptr;
 static uint32_t*   d_target     = nullptr;
 static uint64_t*   d_blob_words = nullptr;
@@ -600,24 +590,21 @@ static void gpu_mine_loop(){
         if(!have_job){Sleep(100);continue;}
 
         // DAG rebuild if needed
-        // FIX v0.19: pool validates shares using epoch_height (start of current epoch),
-        // not the exact block height. Rebuild only when epoch changes (~once per 71 days).
+        // The pool element formula embeds the exact block height h, so we must
+        // rebuild the DAG for every new block height to match the pool's hashes.
         {
-            uint64_t ep_height = ergo_epoch_height(cur.height);
             uint64_t needed_N  = autolykos_n(cur.height);
-            if(needed_N!=dag_N || ep_height!=dag_height || d_dag==nullptr){
+            if(needed_N!=dag_N || cur.height!=dag_height || d_dag==nullptr){
                 if(d_dag){cudaFree(d_dag);d_dag=nullptr;dag_N=0;dag_height=0;}
-                LOG("[DAG] epoch_height=%llu (block=%llu)\n",
-                    (unsigned long long)ep_height,(unsigned long long)cur.height);
+                LOG("[DAG] height=%llu\n", (unsigned long long)cur.height);
                 DWORD t0=GetTickCount();
-                if(build_dag(&d_dag,ep_height,&dag_N)!=cudaSuccess){
+                if(build_dag(&d_dag,cur.height,&dag_N)!=cudaSuccess){
                     Sleep(5000);continue;
                 }
-                dag_height=ep_height;
+                dag_height=cur.height;
                 size_t fb,tb; cudaMemGetInfo(&fb,&tb);
-                LOG("[GPU] DAG OK N=%llu epoch_h=%llu block_h=%llu time=%.1fs free=%.0fMB\n",
+                LOG("[GPU] DAG OK N=%llu block_h=%llu time=%.1fs free=%.0fMB\n",
                     (unsigned long long)dag_N,(unsigned long long)dag_height,
-                    (unsigned long long)cur.height,
                     (GetTickCount()-t0)/1000.0,fb/1048576.0);
                 dag_selftest(d_dag, dag_height);
             }
