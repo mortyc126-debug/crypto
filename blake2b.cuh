@@ -149,6 +149,14 @@ __device__ __forceinline__ uint64_t bswap64_inline(uint64_t x) {
             ((x & 0xFF00000000000000ULL) >> 56);
 }
 
+__device__ __forceinline__ uint32_t bswap32_inline(uint32_t x) {
+    // byte-reverse a uint32
+    return  ((x & 0x000000FFU) << 24) |
+            ((x & 0x0000FF00U) <<  8) |
+            ((x & 0x00FF0000U) >>  8) |
+            ((x & 0xFF000000U) >> 24);
+}
+
 // Hash exactly 32+8=40 bytes (blob_hash[32] || nonce[8]) -> 32 bytes (Blake2b-256)
 // FIX v0.10: Changed from Blake2b-512 (64 bytes) to Blake2b-256 (32 bytes)
 //            to match Ergo Autolykos v2 specification.

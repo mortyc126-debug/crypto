@@ -2,8 +2,12 @@
 #include <stdint.h>
 #include "blake2b.cuh"
 
+// FIX v0.21: N formula updated to match ErgoStratumServer pool:
+//   - iterationsNumber = floor((h - IncreaseStart) / IncreasePeriodForN) + 1  (+1 vs old code)
+//   - Formula: N = N / 100 * 105  (integer division first, then multiply - matches BigInt pool code)
+//   - AUTOLYKOS_MAX_N updated to pool value 2147387550
 static const uint64_t AUTOLYKOS_N0      = 67108864ULL;
-static const uint64_t AUTOLYKOS_MAX_N   = 2143944600ULL;
+static const uint64_t AUTOLYKOS_MAX_N   = 2147387550ULL;  // pool: 2147387550
 static const uint64_t AUTOLYKOS_START   = 614400ULL;
 static const uint64_t AUTOLYKOS_PERIOD  = 51200ULL;
 
@@ -11,13 +15,22 @@ inline uint64_t autolykos_n(uint64_t height) {
     if(height < AUTOLYKOS_START) return AUTOLYKOS_N0;
     uint64_t epoch = (height - AUTOLYKOS_START) / AUTOLYKOS_PERIOD;
     uint64_t N = AUTOLYKOS_N0;
-    for(uint64_t e = 0; e < epoch; e++) {
-        N = N + N / 20;  // integer *1.05, no float drift
+    uint64_t iters = epoch + 1;  // FIX v0.21: pool applies epoch+1 iterations
+    for(uint64_t e = 0; e < iters; e++) {
+        N = N / 100 * 105;  // FIX v0.21: match pool's BigInt: floor(N/100)*105
         if(N >= AUTOLYKOS_MAX_N) return AUTOLYKOS_MAX_N;
     }
     return N;
 }
 
+// FIX v0.21: DAG element formula corrected to match pool (ErgoStratumServer):
+//   Input: i_4BE (4 bytes) || h_4BE (4 bytes) || M_8192 (8192 bytes) = 8200 bytes total
+//   where M = [uint64_be(0), uint64_be(1), ..., uint64_be(1023)] (sequential, NOT zeros)
+//   Output: blake2b-256(input).slice(1, 32) — drops byte[0], keeps 31 bytes
+//   Stored as: out[0]=0, out[1..31]=the 31 element bytes
+//
+// Previous bug (v0.20 and before): used 8-byte i/h and M=zeros (8192 zero bytes).
+// Pool uses 4-byte i/h and M=sequential uint64 BE values.
 __global__ void dag_gen_kernel(
     uint8_t* __restrict__ dag,
     uint64_t start_i,
@@ -27,6 +40,9 @@ __global__ void dag_gen_kernel(
     uint64_t tid = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
     if(tid >= count) return;
     uint64_t i = start_i + tid;
+
+    uint32_t i32 = (uint32_t)i;
+    uint32_t h32 = (uint32_t)height;
 
     uint64_t h[8];
     h[0] = 0x6A09E667F3BCC908ULL ^ (0x01010000ULL | 32);
@@ -38,28 +54,44 @@ __global__ void dag_gen_kernel(
     h[6] = 0x1F83D9ABFB41BD6BULL;
     h[7] = 0x5BE0CD19137E2179ULL;
 
-    // FIX v0.16: index and height must be big-endian bytes to match Ergo reference
-    // (Ergo uses Longs.toByteArray which is big-endian; blake2b word packing is LE,
-    //  so store bswap64(value) so the actual message bytes are in big-endian order)
-    { uint64_t m[16]={bswap64_inline(i),bswap64_inline(height),0,0,0,0,0,0,0,0,0,0,0,0,0,0};
-      blake2b_compress(h, m, 128ULL, 0ULL, false); }
+    // Block 0 (bytes 0-127):
+    //   bytes 0-3:   i as 4-byte BE -> packed LE = bswap32(i32)
+    //   bytes 4-7:   h as 4-byte BE -> packed LE = bswap32(h32)
+    //   bytes 8-127: M[0..14] as uint64 BE -> m[k] = bswap64(k-1) for k=1..15
+    {
+        uint64_t m[16];
+        m[0] = (uint64_t)bswap32_inline(i32) | ((uint64_t)bswap32_inline(h32) << 32);
+        #pragma unroll
+        for(int k = 1; k <= 15; k++)
+            m[k] = bswap64_inline((uint64_t)(k - 1));
+        blake2b_compress(h, m, 128ULL, 0ULL, false);
+    }
 
-    { uint64_t mz[16]={};
-      #pragma unroll 1
-      for(int blk=1; blk<=63; blk++)
-          blake2b_compress(h, mz, (uint64_t)(blk+1)*128ULL, 0ULL, false);
-      blake2b_compress(h, mz, 8208ULL, 0ULL, true); }
+    // Blocks 1..63 (16 M words each):
+    //   Block n starts at M word index 16n-1
+    //   m[k] = bswap64(16n - 1 + k) for k=0..15
+    #pragma unroll 1
+    for(int blk = 1; blk <= 63; blk++) {
+        uint64_t m[16];
+        uint64_t base = (uint64_t)(16 * blk - 1);
+        #pragma unroll
+        for(int k = 0; k < 16; k++)
+            m[k] = bswap64_inline(base + (uint64_t)k);
+        blake2b_compress(h, m, (uint64_t)(blk + 1) * 128ULL, 0ULL, false);
+    }
 
-    // FIX v0.20: DAG element is last 31 bytes of blake2b output.
-    // Pool (ErgoStratumServer) computes: blake2b(i||h||M).slice(1, 32)
-    // i.e. drops byte[0] (LE_byte[0] = LSB of first word) and keeps bytes[1..31].
-    // Those 31 bytes are treated as a big-endian 248-bit integer (via toBigIntBE).
-    // In add256 (big-endian addition, carry from index 31→0), we store:
-    //   out[0]=0 (MSB, was the discarded LE_byte[0]), out[1..31]=LE_byte[1..31].
+    // Block 64 (last): M[1023] + zeros, total bytes consumed = 8200
+    {
+        uint64_t m[16] = {};
+        m[0] = bswap64_inline(1023ULL);
+        blake2b_compress(h, m, 8200ULL, 0ULL, true);
+    }
+
+    // Store: out[0]=0 (discarded byte), out[1..31] = blake2b bytes[1..31]
     uint8_t* out = dag + i * 32;
     out[0] = 0;
     #pragma unroll
-    for(int b=1; b<32; b++)
+    for(int b = 1; b < 32; b++)
         out[b] = (uint8_t)((h[b/8] >> ((b%8)*8)) & 0xFF);
 }
 
@@ -95,9 +127,6 @@ cudaError_t build_dag(uint8_t** d_dag, uint64_t height, uint64_t* out_N) {
     printf("[DAG] cudaMalloc OK (%.3fGB allocated)\n", dag_gb);
     fflush(stdout);
 
-    // FIX v0.18: launch all chunks without per-chunk cudaDeviceSynchronize.
-    // Previous code synced after every 65536-element chunk (2853 syncs total),
-    // keeping GPU utilization at ~1%.  Now: launch all chunks async, sync once.
     const int      THREADS = 256;
     const uint64_t CHUNK   = 1ULL << 16;  // 65536 elements per kernel launch
 
