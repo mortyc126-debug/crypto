@@ -1,20 +1,19 @@
-// ErgoMiner v0.19
+// ErgoMiner v0.20
+// Fix v0.20: DAG element is 31 bytes, not 32.
+//            Pool (ErgoStratumServer) computes: blake2b(i||h||M).slice(1,32)
+//            i.e. drops byte[0] of the blake2b LE output (the LSB of the first word)
+//            and treats bytes[1..31] as a big-endian 248-bit integer.
+//            Fix: store out[0]=0 instead of LE_byte[0] in dag_gen_kernel.
+//            This was the root cause of all "Low difficulty share" rejections.
 // Fix v0.19: Use epoch-level height for DAG generation (confirmed by "Low difficulty" rejection).
 //            The pool validates shares using epoch_height = 614400 + floor((h-614400)/51200)*51200,
 //            not the exact block height. All blocks in epoch 21 (heights 1689600-1740799) share
 //            the same DAG. Rebuild only when epoch changes (~once every 71 days).
 // Fix v0.18: Remove per-chunk cudaDeviceSynchronize in DAG generation.
-// Fix v0.17: (reverted) Rebuild on every height change — was correct but pool uses epoch height.
-// Fix v0.16: DAG element generation now uses big-endian encoding of index and height
-//            (matching Ergo reference Longs.toByteArray), and uses all 32 hash bytes
-//            as the element value (was forcing out[0]=0 and skipping hash[0]).
-// Fix v0.12: Sum 32 DAG elements as 256-bit (32 bytes), not 248-bit (31 bytes).
-//            The carry into the high byte was lost, causing wrong final hash.
-//            Also hash 32-byte sum (was hashing only 31 bytes).
-// Fix v0.11: Blake2b-256 for seed (was Blake2b-512), add genIndexes second hash,
-//            fix index generation to use contiguous byte sliding window.
-// Fix v0.7: nonce hashed as big-endian bytes to match pool/network verification
-// Fix v0.7: increased GPU occupancy (BLOCKS 112->448) for ~4x hashrate improvement
+// Fix v0.16: DAG element generation now uses big-endian encoding of index and height.
+// Fix v0.12: Sum 32 DAG elements as 256-bit (32 bytes).
+// Fix v0.11: Blake2b-256 for seed, add genIndexes second hash, contiguous sliding window.
+// Fix v0.7: nonce hashed as big-endian bytes; increased GPU occupancy (BLOCKS 112->448)
 #define _WIN32_WINNT 0x0600
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -725,11 +724,10 @@ static void hashrate_thread(){
 
 int main(){
     srand((unsigned)time(nullptr));
-    LOG("=== ErgoMiner v0.19 ===\n");
+    LOG("=== ErgoMiner v0.20 ===\n");
+    LOG("[FIX] DAG element: 31 bytes (drop byte[0] of blake2b LE output) - fixes Low difficulty\n");
     LOG("[FIX] Epoch-level DAG: pool uses epoch_height for verification, rebuild ~once per 71 days\n");
     LOG("[FIX] Async DAG generation: sync barriers removed, fast build\n");
-    LOG("[FIX] DAG element: big-endian index/height + full 32-byte hash output\n");
-    LOG("[FIX] 256-bit (32-byte) DAG element sum + 32-byte final hash input\n");
     LOG("[FIX] Blake2b-256 for seed hash, genIndexes double-hash, contiguous sliding window\n");
     LOG("[FIX] nonce hashed as big-endian bytes (matches pool verification)\n");
     WSADATA wsa; WSAStartup(MAKEWORD(2,2),&wsa);
