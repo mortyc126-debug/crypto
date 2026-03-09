@@ -38,7 +38,10 @@ __global__ void dag_gen_kernel(
     h[6] = 0x1F83D9ABFB41BD6BULL;
     h[7] = 0x5BE0CD19137E2179ULL;
 
-    { uint64_t m[16]={i,height,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+    // FIX v0.16: index and height must be big-endian bytes to match Ergo reference
+    // (Ergo uses Longs.toByteArray which is big-endian; blake2b word packing is LE,
+    //  so store bswap64(value) so the actual message bytes are in big-endian order)
+    { uint64_t m[16]={bswap64_inline(i),bswap64_inline(height),0,0,0,0,0,0,0,0,0,0,0,0,0,0};
       blake2b_compress(h, m, 128ULL, 0ULL, false); }
 
     { uint64_t mz[16]={};
@@ -47,10 +50,11 @@ __global__ void dag_gen_kernel(
           blake2b_compress(h, mz, (uint64_t)(blk+1)*128ULL, 0ULL, false);
       blake2b_compress(h, mz, 8208ULL, 0ULL, true); }
 
+    // FIX v0.16: use all 32 bytes of the hash output as the element value
+    // (Ergo reference: BigInt(1, hash) uses all 32 bytes; do not force out[0]=0)
     uint8_t* out = dag + i * 32;
-    out[0] = 0;
     #pragma unroll
-    for(int b=1; b<32; b++)
+    for(int b=0; b<32; b++)
         out[b] = (uint8_t)((h[b/8] >> ((b%8)*8)) & 0xFF);
 }
 

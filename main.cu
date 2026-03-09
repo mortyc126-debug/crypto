@@ -1,4 +1,7 @@
-// ErgoMiner v0.15
+// ErgoMiner v0.16
+// Fix v0.16: DAG element generation now uses big-endian encoding of index and height
+//            (matching Ergo reference Longs.toByteArray), and uses all 32 hash bytes
+//            as the element value (was forcing out[0]=0 and skipping hash[0]).
 // Fix v0.12: Sum 32 DAG elements as 256-bit (32 bytes), not 248-bit (31 bytes).
 //            The carry into the high byte was lost, causing wrong final hash.
 //            Also hash 32-byte sum (was hashing only 31 bytes).
@@ -461,7 +464,7 @@ static void stratum_recv_thread(){
 
 static void stratum_subscribe(){
     char buf[256];
-    snprintf(buf,sizeof(buf),"{\"id\":%d,\"method\":\"mining.subscribe\",\"params\":[\"ergominer/0.15\"]}",g_msg_id.fetch_add(1));
+    snprintf(buf,sizeof(buf),"{\"id\":%d,\"method\":\"mining.subscribe\",\"params\":[\"ergominer/0.16\"]}",g_msg_id.fetch_add(1));
     send_line(buf);
 }
 static void stratum_authorize(){
@@ -522,7 +525,7 @@ static void dag_selftest(const uint8_t* d_dag, uint64_t height) {
     for(int i=32;i<64;i++) LOG("%02x",out[i]);
     LOG("\n");
     LOG("[DAG-VERIFY] Python check: import hashlib,struct; "
-        "e=lambda i,h: (b'\\x00'+hashlib.blake2b(struct.pack('<QQ',i,h)+bytes(8192),digest_size=32).digest()[1:32]).hex(); "
+        "e=lambda i,h: hashlib.blake2b(struct.pack('>QQ',i,h)+bytes(8192),digest_size=32).hexdigest(); "
         "print(e(0,%llu)); print(e(1,%llu))\n",
         (unsigned long long)height, (unsigned long long)height);
 }
@@ -697,7 +700,8 @@ static void hashrate_thread(){
 
 int main(){
     srand((unsigned)time(nullptr));
-    LOG("=== ErgoMiner v0.15 ===\n");
+    LOG("=== ErgoMiner v0.16 ===\n");
+    LOG("[FIX] DAG element: big-endian index/height + full 32-byte hash output\n");
     LOG("[FIX] 256-bit (32-byte) DAG element sum + 32-byte final hash input\n");
     LOG("[FIX] Blake2b-256 for seed hash, genIndexes double-hash, contiguous sliding window\n");
     LOG("[FIX] nonce hashed as big-endian bytes (matches pool verification)\n");
