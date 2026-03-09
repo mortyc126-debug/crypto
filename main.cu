@@ -1,14 +1,18 @@
-// ErgoMiner v0.20
-// Fix v0.20: DAG element is 31 bytes, not 32.
-//            Pool (ErgoStratumServer) computes: blake2b(i||h||M).slice(1,32)
-//            i.e. drops byte[0] of the blake2b LE output (the LSB of the first word)
-//            and treats bytes[1..31] as a big-endian 248-bit integer.
-//            Fix: store out[0]=0 instead of LE_byte[0] in dag_gen_kernel.
-//            This was the root cause of all "Low difficulty share" rejections.
-// Fix v0.19: Use epoch-level height for DAG generation (confirmed by "Low difficulty" rejection).
-//            The pool validates shares using epoch_height = 614400 + floor((h-614400)/51200)*51200,
-//            not the exact block height. All blocks in epoch 21 (heights 1689600-1740799) share
-//            the same DAG. Rebuild only when epoch changes (~once every 71 days).
+// ErgoMiner v0.21
+// Fix v0.21: Correct full Autolykos v2 algorithm to match ErgoStratumServer pool verification:
+//   1. DAG element formula: blake2b(i_4BE || h_4BE || M_sequential)[1:32]
+//      - i and h are now 4-byte BE (was 8-byte) to match pool's BigIntBuffer.toBufferBE(..., 4)
+//      - M is now [uint64_be(0)..uint64_be(1023)] = 8192 bytes (was zeros)
+//      - Total input: 8200 bytes (was 8208 bytes)
+//   2. N formula: epoch+1 iterations of N/100*105 (was epoch iterations of N+N/20)
+//      - Pool: iterationsNumber = floor((h-614400)/51200) + 1
+//      - Division method: floor(N/100)*105 to match pool's BigInt arithmetic
+//   3. genIndexes seed: e(31 bytes) || coinbase(40 bytes) -> blake2b-256 (was just blake2b(seed))
+//      - e = DAG element at i_idx = bswap64(seed[3]) % N  (from last 8 bytes of seed)
+//      - coinbase = msg(32) || nonce_BE(8)
+//   4. Extended hash: gihash || gihash (64 bytes), sliding 4-byte BE window (unchanged)
+// Fix v0.20: DAG element is 31 bytes (drop byte[0]).
+// Fix v0.19: Use epoch-level height for DAG generation.
 // Fix v0.18: Remove per-chunk cudaDeviceSynchronize in DAG generation.
 // Fix v0.16: DAG element generation now uses big-endian encoding of index and height.
 // Fix v0.12: Sum 32 DAG elements as 256-bit (32 bytes).
@@ -126,14 +130,16 @@ static uint64_t*   d_blob_words = nullptr;
 
 // Debug kernel: verbose intermediate value dump to pinpoint CPU/GPU divergence
 // Output layout (all uint64, 64 elements):
-//   [0..3]   = seed[0..3]         (Blake2b256(msg||nonce) output, 32 bytes)
-//   [4..7]   = hash[0..3]         (Blake2b256(seed), genIndexes hash)
-//   [8..11]  = extended[0..3] as bytes packed into u64
-//   [16..19] = idx[0..3] as u64
-//   [20..23] = DAG[idx[0]][0..3] as u64 (raw 32-byte elem, first 4 words)
-//   [28..31] = sum[0..3] as u64 (32-byte sum, packed as LE)
-//   [32..35] = final_hash[0..3] (blake2b-256 of sum)
-//   [36..43] = fh_be[0..7] as u64
+//   [0..3]   = seed[0..3]          (Blake2b256(msg||nonce_BE) output, 32 bytes)
+//   [4]      = i_idx               (bswap64(seed[3]) % N, initial element index)
+//   [5..8]   = DAG[i_idx][0..3]    (first pre-element e, 32 bytes LE packed)
+//   [9..12]  = gihash[0..3]        (blake2b-256 of e||coinbase, genIndexes hash)
+//   [13..16] = extended[0..3]      (gihash bytes packed as LE u64)
+//   [17..20] = idx[0..3]           (first 4 genIndexes results)
+//   [21..24] = DAG[idx[0]][0..3]   (first element from sum, LE packed)
+//   [28..31] = sum[0..3]           (32-byte sum, LE packed)
+//   [32..35] = final_hash[0..3]    (blake2b-256 of sum)
+//   [36..43] = fh_be[0..7]         (final hash as BE uint32 words)
 __global__ void debug_one_hash_kernel(
     const uint8_t* __restrict__ dag,
     uint64_t N,
@@ -148,71 +154,89 @@ __global__ void debug_one_hash_kernel(
     blake2b_hash_40(blob_words, nonce, seed);
     for(int i=0;i<4;i++) out_debug[i]=seed[i];
 
-    // Step 2: hash = Blake2b256(seed)  [genIndexes internal hash]
-    uint64_t hash[4];
-    blake2b_256_32(seed, hash);
-    for(int i=0;i<4;i++) out_debug[4+i]=hash[i];
+    // Step 2: i_idx = toBigIntBE(seed[24:32]) % N = bswap64(seed[3]) % N
+    uint32_t i_idx = (uint32_t)(bswap64_inline(seed[3]) % N);
+    out_debug[4] = (uint64_t)i_idx;
 
-    // Step 3: Build 35-byte extended hash
-    uint8_t extended[36];
+    // Step 3: e = DAG element at i_idx
+    const uint8_t* eptr = dag + (uint64_t)i_idx * 32;
     for(int i=0;i<4;i++){
-        for(int j=0;j<8;j++)
-            extended[i*8+j] = (uint8_t)(hash[i] >> (j*8));
+        uint64_t v=0;
+        for(int j=0;j<8;j++) v|=((uint64_t)eptr[i*8+j])<<(j*8);
+        out_debug[5+i]=v;
     }
-    extended[32] = extended[0];
-    extended[33] = extended[1];
-    extended[34] = extended[2];
 
-    // Pack first 32 bytes of extended into debug slots
+    // Step 4: genIndexes hash = blake2b-256(e[1..31] || msg[32] || nonce_BE[8]) = 71 bytes
+    uint64_t m_gi[16] = {};
+    for(int j=0; j<31; j++)
+        m_gi[j/8] |= ((uint64_t)eptr[j+1]) << ((j%8)*8);
+    for(int j=0; j<32; j++) {
+        uint8_t b=(uint8_t)((blob_words[j/8]>>((j%8)*8))&0xFF);
+        int pos=31+j; m_gi[pos/8]|=((uint64_t)b)<<((pos%8)*8);
+    }
+    for(int j=0; j<8; j++) {
+        uint8_t b=(uint8_t)((nonce>>((7-j)*8))&0xFF);
+        int pos=63+j; m_gi[pos/8]|=((uint64_t)b)<<((pos%8)*8);
+    }
+    uint64_t hh[8];
+    hh[0]=0x6A09E667F3BCC908ULL^(0x01010000ULL|32);
+    hh[1]=0xBB67AE8584CAA73BULL; hh[2]=0x3C6EF372FE94F82BULL;
+    hh[3]=0xA54FF53A5F1D36F1ULL; hh[4]=0x510E527FADE682D1ULL;
+    hh[5]=0x9B05688C2B3E6C1FULL; hh[6]=0x1F83D9ABFB41BD6BULL;
+    hh[7]=0x5BE0CD19137E2179ULL;
+    blake2b_compress(hh, m_gi, 71ULL, 0ULL, true);
+    uint64_t gihash[4]={hh[0],hh[1],hh[2],hh[3]};
+    for(int i=0;i<4;i++) out_debug[9+i]=gihash[i];
+
+    // Step 5: Build extended bytes
+    uint8_t extended[36];
+    for(int i=0;i<4;i++)
+        for(int j=0;j<8;j++) extended[i*8+j]=(uint8_t)(gihash[i]>>(j*8));
+    extended[32]=extended[0]; extended[33]=extended[1]; extended[34]=extended[2];
     for(int i=0;i<4;i++){
         uint64_t v=0;
         for(int j=0;j<8;j++) v|=((uint64_t)extended[i*8+j])<<(j*8);
-        out_debug[8+i]=v;
+        out_debug[13+i]=v;
     }
 
-    // Step 4: Generate 32 indices
+    // Step 6: Generate 32 indices
     uint32_t idx[32];
     for(int i=0;i<32;i++){
-        uint32_t v = ((uint32_t)extended[i]   << 24) |
-                     ((uint32_t)extended[i+1] << 16) |
-                     ((uint32_t)extended[i+2] <<  8) |
-                      (uint32_t)extended[i+3];
-        idx[i] = (uint32_t)((uint64_t)v % N);
+        uint32_t v=((uint32_t)extended[i]<<24)|((uint32_t)extended[i+1]<<16)|
+                   ((uint32_t)extended[i+2]<<8)|(uint32_t)extended[i+3];
+        idx[i]=(uint32_t)((uint64_t)v%N);
     }
-    for(int i=0;i<4;i++) out_debug[16+i]=(uint64_t)idx[i];
+    for(int i=0;i<4;i++) out_debug[17+i]=(uint64_t)idx[i];
 
-    // First DAG element raw (32 bytes = 4 uint64)
+    // First DAG element from sum indices
     {
         const uint8_t* p=dag+(uint64_t)idx[0]*32;
         for(int i=0;i<4;i++){
             uint64_t v=0;
             for(int j=0;j<8;j++) v|=((uint64_t)p[i*8+j])<<(j*8);
-            out_debug[20+i]=v;
+            out_debug[21+i]=v;
         }
     }
 
-    // Sum (32-byte / 256-bit big-endian addition)
+    // Step 7: Sum 32 DAG elements
     uint8_t sum[32]={};
     for(int k=0;k<32;k++){
         const uint8_t* p=dag+(uint64_t)idx[k]*32;
         uint32_t carry=0;
         for(int j=31;j>=0;j--){uint32_t s=(uint32_t)sum[j]+p[j]+carry;sum[j]=(uint8_t)s;carry=s>>8;}
     }
-    // Pack sum as LE uint64 words
-    {
-        for(int i=0;i<4;i++){
-            uint64_t v=0;
-            for(int j=0;j<8;j++) v|=((uint64_t)sum[i*8+j])<<(j*8);
-            out_debug[28+i]=v;
-        }
+    for(int i=0;i<4;i++){
+        uint64_t v=0;
+        for(int j=0;j<8;j++) v|=((uint64_t)sum[i*8+j])<<(j*8);
+        out_debug[28+i]=v;
     }
 
-    // Final hash
+    // Step 8: Final hash
     uint64_t fh[4];
     blake2b_hash_32(sum, fh);
     for(int i=0;i<4;i++) out_debug[32+i]=fh[i];
 
-    // fh_be
+    // Step 9: fh_be
     uint32_t fh_be[8];
     for(int i=0;i<4;i++){
         uint32_t lo32=(uint32_t)(fh[i]&0xFFFFFFFF);
@@ -480,7 +504,7 @@ static void stratum_recv_thread(){
 
 static void stratum_subscribe(){
     char buf[256];
-    snprintf(buf,sizeof(buf),"{\"id\":%d,\"method\":\"mining.subscribe\",\"params\":[\"ergominer/0.19\"]}",g_msg_id.fetch_add(1));
+    snprintf(buf,sizeof(buf),"{\"id\":%d,\"method\":\"mining.subscribe\",\"params\":[\"ergominer/0.21\"]}",g_msg_id.fetch_add(1));
     send_line(buf);
 }
 static void stratum_authorize(){
@@ -541,7 +565,8 @@ static void dag_selftest(const uint8_t* d_dag, uint64_t height) {
     for(int i=32;i<64;i++) LOG("%02x",out[i]);
     LOG("\n");
     LOG("[DAG-VERIFY] Python check: import hashlib,struct; "
-        "e=lambda i,h: hashlib.blake2b(struct.pack('>QQ',i,h)+bytes(8192),digest_size=32).hexdigest(); "
+        "M=b''.join(struct.pack('>Q',k) for k in range(1024)); "
+        "e=lambda i,h: hashlib.blake2b(struct.pack('>I',i)+struct.pack('>I',h)+M,digest_size=32).digest()[1:].hex(); "
         "print(e(0,%llu)); print(e(1,%llu))\n",
         (unsigned long long)height, (unsigned long long)height);
 }
@@ -631,31 +656,32 @@ static void gpu_mine_loop(){
             cudaMemcpy(dbg,d_dbg,64*sizeof(uint64_t),cudaMemcpyDeviceToHost);
             cudaFree(d_dbg);
 
-            LOG("[DEBUG] GPU seed[0:4]:   %016llx %016llx %016llx %016llx\n",
+            LOG("[DEBUG] GPU seed[0:4]:    %016llx %016llx %016llx %016llx\n",
                 (unsigned long long)dbg[0],(unsigned long long)dbg[1],
                 (unsigned long long)dbg[2],(unsigned long long)dbg[3]);
-            LOG("[DEBUG] GPU hash[0:4]:   %016llx %016llx %016llx %016llx\n",
-                (unsigned long long)dbg[4],(unsigned long long)dbg[5],
-                (unsigned long long)dbg[6],(unsigned long long)dbg[7]);
-            LOG("[DEBUG] GPU ext[0:4]:    %016llx %016llx %016llx %016llx\n",
-                (unsigned long long)dbg[8],(unsigned long long)dbg[9],
-                (unsigned long long)dbg[10],(unsigned long long)dbg[11]);
-            LOG("[DEBUG] GPU idx[0:4]:    %u %u %u %u\n",
-                (unsigned)(dbg[16]),(unsigned)(dbg[17]),
-                (unsigned)(dbg[18]),(unsigned)(dbg[19]));
-            LOG("[DEBUG] GPU DAG[idx0]:   %016llx %016llx %016llx %016llx\n",
-                (unsigned long long)dbg[20],(unsigned long long)dbg[21],
-                (unsigned long long)dbg[22],(unsigned long long)dbg[23]);
-            LOG("[DEBUG] GPU sum[0:4]:    %016llx %016llx %016llx %016llx\n",
+            LOG("[DEBUG] GPU i_idx:        %llu\n", (unsigned long long)dbg[4]);
+            LOG("[DEBUG] GPU e=DAG[i_idx]: %016llx %016llx %016llx %016llx\n",
+                (unsigned long long)dbg[5],(unsigned long long)dbg[6],
+                (unsigned long long)dbg[7],(unsigned long long)dbg[8]);
+            LOG("[DEBUG] GPU gihash[0:4]:  %016llx %016llx %016llx %016llx\n",
+                (unsigned long long)dbg[9],(unsigned long long)dbg[10],
+                (unsigned long long)dbg[11],(unsigned long long)dbg[12]);
+            LOG("[DEBUG] GPU idx[0:4]:     %u %u %u %u\n",
+                (unsigned)(dbg[17]),(unsigned)(dbg[18]),
+                (unsigned)(dbg[19]),(unsigned)(dbg[20]));
+            LOG("[DEBUG] GPU DAG[idx0]:    %016llx %016llx %016llx %016llx\n",
+                (unsigned long long)dbg[21],(unsigned long long)dbg[22],
+                (unsigned long long)dbg[23],(unsigned long long)dbg[24]);
+            LOG("[DEBUG] GPU sum[0:4]:     %016llx %016llx %016llx %016llx\n",
                 (unsigned long long)dbg[28],(unsigned long long)dbg[29],
                 (unsigned long long)dbg[30],(unsigned long long)dbg[31]);
-            LOG("[DEBUG] GPU final_hash:  %016llx %016llx %016llx %016llx\n",
+            LOG("[DEBUG] GPU final_hash:   %016llx %016llx %016llx %016llx\n",
                 (unsigned long long)dbg[32],(unsigned long long)dbg[33],
                 (unsigned long long)dbg[34],(unsigned long long)dbg[35]);
-            LOG("[DEBUG] GPU fh_be:       %08x%08x%08x%08x%08x%08x%08x%08x\n",
+            LOG("[DEBUG] GPU fh_be:        %08x%08x%08x%08x%08x%08x%08x%08x\n",
                 (unsigned)(dbg[36]),(unsigned)(dbg[37]),(unsigned)(dbg[38]),(unsigned)(dbg[39]),
                 (unsigned)(dbg[40]),(unsigned)(dbg[41]),(unsigned)(dbg[42]),(unsigned)(dbg[43]));
-            LOG("[DEBUG] share_target:    %08x%08x%08x%08x%08x%08x%08x%08x\n",
+            LOG("[DEBUG] share_target:     %08x%08x%08x%08x%08x%08x%08x%08x\n",
                 g_share_target[0],g_share_target[1],g_share_target[2],g_share_target[3],
                 g_share_target[4],g_share_target[5],g_share_target[6],g_share_target[7]);
         }
@@ -724,12 +750,11 @@ static void hashrate_thread(){
 
 int main(){
     srand((unsigned)time(nullptr));
-    LOG("=== ErgoMiner v0.20 ===\n");
-    LOG("[FIX] DAG element: 31 bytes (drop byte[0] of blake2b LE output) - fixes Low difficulty\n");
-    LOG("[FIX] Epoch-level DAG: pool uses epoch_height for verification, rebuild ~once per 71 days\n");
-    LOG("[FIX] Async DAG generation: sync barriers removed, fast build\n");
-    LOG("[FIX] Blake2b-256 for seed hash, genIndexes double-hash, contiguous sliding window\n");
-    LOG("[FIX] nonce hashed as big-endian bytes (matches pool verification)\n");
+    LOG("=== ErgoMiner v0.21 ===\n");
+    LOG("[FIX] DAG: 4-byte i/h BE, M=sequential uint64 BE [0..1023], 8200-byte input\n");
+    LOG("[FIX] N formula: epoch+1 iterations of N/100*105 (matches ErgoStratumServer)\n");
+    LOG("[FIX] genIndexes: seed = e(31B)||coinbase(40B), e=DAG[bswap64(seed[3])%%N]\n");
+    LOG("[FIX] Epoch-level DAG height, async generation, Blake2b-256 throughout\n");
     WSADATA wsa; WSAStartup(MAKEWORD(2,2),&wsa);
     CUDA_CHECK(cudaSetDevice(0));
     cudaDeviceProp prop; cudaGetDeviceProperties(&prop,0);
