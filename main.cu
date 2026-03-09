@@ -1,4 +1,4 @@
-// ErgoMiner v0.12
+// ErgoMiner v0.13
 // Fix v0.12: Sum 32 DAG elements as 256-bit (32 bytes), not 248-bit (31 bytes).
 //            The carry into the high byte was lost, causing wrong final hash.
 //            Also hash 32-byte sum (was hashing only 31 bytes).
@@ -284,15 +284,17 @@ static void parse_subscribe_response(const std::string& line) {
                     if(after < sub.size() && isdigit(sub[after])) {
                         char* endp;
                         long val = strtol(sub.c_str()+after, &endp, 10);
-                        if(endp == sub.c_str()+after || val < 2 || val > 16) {
-                            LOG("[STRATUM] Invalid nonce_total_size from pool, using defaults\n");
+                        if(endp == sub.c_str()+after || val < 1 || val > 16) {
+                            LOG("[STRATUM] Invalid extranonce2_size from pool, using defaults\n");
                         } else {
-                            g_nonce_total_size = (int)val;
-                            g_extranonce2_size = g_nonce_total_size - en1_bytes;
-                            if(g_extranonce2_size < 1) g_extranonce2_size = 4;
+                            // FIX v0.13: val IS extranonce2_size, NOT nonce_total_size
+                            // Pool subscribe returns [subscriptions, extranonce1, extranonce2_size]
+                            // e.g. ["1f14", 6] means en1=2 bytes, en2=6 bytes, total=8 bytes
+                            g_extranonce2_size = (int)val;
+                            g_nonce_total_size = en1_bytes + g_extranonce2_size;
                         }
-                        LOG("[STRATUM] extranonce1=%s (%d bytes), nonce_total=%d, extranonce2_size=%d\n",
-                            g_extranonce1.c_str(), en1_bytes, g_nonce_total_size, g_extranonce2_size);
+                        LOG("[STRATUM] extranonce1=%s (%d bytes), extranonce2_size=%d, nonce_total=%d\n",
+                            g_extranonce1.c_str(), en1_bytes, g_extranonce2_size, g_nonce_total_size);
                     }
                     break;
                 }
@@ -459,7 +461,7 @@ static void stratum_recv_thread(){
 
 static void stratum_subscribe(){
     char buf[256];
-    snprintf(buf,sizeof(buf),"{\"id\":%d,\"method\":\"mining.subscribe\",\"params\":[\"ergominer/0.12\"]}",g_msg_id.fetch_add(1));
+    snprintf(buf,sizeof(buf),"{\"id\":%d,\"method\":\"mining.subscribe\",\"params\":[\"ergominer/0.13\"]}",g_msg_id.fetch_add(1));
     send_line(buf);
 }
 static void stratum_authorize(){
@@ -694,7 +696,7 @@ static void hashrate_thread(){
 
 int main(){
     srand((unsigned)time(nullptr));
-    LOG("=== ErgoMiner v0.12 ===\n");
+    LOG("=== ErgoMiner v0.13 ===\n");
     LOG("[FIX] 256-bit (32-byte) DAG element sum + 32-byte final hash input\n");
     LOG("[FIX] Blake2b-256 for seed hash, genIndexes double-hash, contiguous sliding window\n");
     LOG("[FIX] nonce hashed as big-endian bytes (matches pool verification)\n");
