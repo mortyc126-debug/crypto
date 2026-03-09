@@ -90,50 +90,29 @@ cudaError_t build_dag(uint8_t** d_dag, uint64_t height, uint64_t* out_N) {
     printf("[DAG] cudaMalloc OK (%.3fGB allocated)\n", dag_gb);
     fflush(stdout);
 
+    // FIX v0.18: launch all chunks without per-chunk cudaDeviceSynchronize.
+    // Previous code synced after every 65536-element chunk (2853 syncs total),
+    // keeping GPU utilization at ~1%.  Now: launch all chunks async, sync once.
     const int      THREADS = 256;
-    const uint64_t CHUNK   = 1ULL << 16;
+    const uint64_t CHUNK   = 1ULL << 16;  // 65536 elements per kernel launch
 
-    uint64_t total_chunks = (N + CHUNK - 1) / CHUNK;
-    printf("[DAG] Generating %llu elements in %llu chunks of %llu...\n",
-           (unsigned long long)N,
-           (unsigned long long)total_chunks,
-           (unsigned long long)CHUNK);
+    printf("[DAG] Generating %llu elements (async)...\n", (unsigned long long)N);
     fflush(stdout);
 
     for(uint64_t start=0; start<N; start+=CHUNK) {
         uint64_t count = (start+CHUNK > N) ? (N-start) : CHUNK;
         uint32_t grid  = (uint32_t)((count+THREADS-1)/THREADS);
-
         dag_gen_kernel<<<grid, THREADS>>>(*d_dag, start, height, count);
-
-        err = cudaGetLastError();
-        if(err != cudaSuccess) {
-            printf("[DAG] LAUNCH ERROR @%llu: %s\n",
-                   (unsigned long long)start, cudaGetErrorString(err));
-            fflush(stdout);
-            cudaFree(*d_dag); *d_dag=nullptr; return err;
-        }
-
-        err = cudaDeviceSynchronize();
-        if(err != cudaSuccess) {
-            printf("[DAG] SYNC ERROR @%llu (%.1f%%): %s\n",
-                   (unsigned long long)start,
-                   100.0*start/N,
-                   cudaGetErrorString(err));
-            fflush(stdout);
-            cudaFree(*d_dag); *d_dag=nullptr; return err;
-        }
-
-        if((start % (1024*1024)) < CHUNK) {
-            printf("[DAG] %.1f%%  (%llu / %llu)\n",
-                   100.0*(start+count)/N,
-                   (unsigned long long)(start+count),
-                   (unsigned long long)N);
-            fflush(stdout);
-        }
     }
 
-    printf("[DAG] 100.0%%  Generation complete.\n");
+    // Single synchronize after all chunks are queued
+    err = cudaDeviceSynchronize();
+    if(err != cudaSuccess) {
+        printf("[DAG] ERROR: %s\n", cudaGetErrorString(err));
+        fflush(stdout);
+        cudaFree(*d_dag); *d_dag=nullptr; return err;
+    }
+    printf("[DAG] Generation complete.\n");
     fflush(stdout);
     return cudaSuccess;
 }
