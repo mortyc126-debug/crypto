@@ -13,18 +13,28 @@ __device__ __forceinline__ void load_dag_element(
     uint32_t idx,
     uint8_t* elem)
 {
-    const uint8_t* p = dag + (uint64_t)idx * 32;
-    #pragma unroll
-    for(int j=0;j<32;j++) elem[j] = p[j];
+    // Two 128-bit reads through read-only cache (texture path).
+    // Each element is 32 bytes aligned on a 32-byte boundary.
+    const uint4* p = (const uint4*)(dag + (uint64_t)idx * 32);
+    ((uint4*)elem)[0] = __ldg(p);
+    ((uint4*)elem)[1] = __ldg(p + 1);
 }
 
 __device__ __forceinline__ void add256(uint8_t* __restrict__ a, const uint8_t* __restrict__ b) {
+    // Process 4 bytes at a time (8 iterations instead of 32).
+    // Bytes are stored big-endian: a[0]=MSB, a[31]=LSB.
+    // uint32 word[i] covers bytes [4i..4i+3]; word[7] is least significant.
+    // bswap each word to get its LE numeric value, add with carry, bswap back.
+    uint32_t* a32 = (uint32_t*)a;
+    const uint32_t* b32 = (const uint32_t*)b;
     uint32_t carry = 0;
     #pragma unroll
-    for(int i=31; i>=0; i--){
-        uint32_t s = (uint32_t)a[i] + b[i] + carry;
-        a[i] = (uint8_t)s;
-        carry = s >> 8;
+    for(int i = 7; i >= 0; i--) {
+        uint64_t s = (uint64_t)__byte_perm(a32[i], 0, 0x0123)
+                   + (uint64_t)__byte_perm(b32[i], 0, 0x0123)
+                   + carry;
+        carry    = (uint32_t)(s >> 32);
+        a32[i]   = __byte_perm((uint32_t)s, 0, 0x0123);
     }
 }
 
@@ -39,14 +49,16 @@ __device__ __forceinline__ void blake2b_hash_32(const uint8_t* in, uint64_t out[
     h[6] = 0x1F83D9ABFB41BD6BULL;
     h[7] = 0x5BE0CD19137E2179ULL;
     uint64_t m[16] = {};
+    // Direct 64-bit word loads: `in` is __align__(16) so this is safe.
+    // Blake2b packs bytes in LE order which matches a direct uint64 cast.
+    const uint64_t* in64 = (const uint64_t*)in;
     #pragma unroll
-    for(int i=0; i<32; i++)
-        m[i/8] |= ((uint64_t)in[i]) << ((i%8)*8);
+    for(int i = 0; i < 4; i++) m[i] = in64[i];
     blake2b_compress(h, m, 32ULL, 0ULL, true);
     out[0]=h[0]; out[1]=h[1]; out[2]=h[2]; out[3]=h[3];
 }
 
-__global__ void mine_kernel(
+__global__ __launch_bounds__(256, 6) void mine_kernel(
     const uint8_t* __restrict__ dag,
     uint64_t N,
     const uint64_t* __restrict__ blob_words,
@@ -147,9 +159,11 @@ __global__ void mine_kernel(
     }
 
     // Step 7: Sum 32 DAG elements (32-byte / 256-bit big-endian addition)
-    uint8_t sum[32] = {};
-    uint8_t elem[32];
-    #pragma unroll 4
+    // __align__(16): required for uint4 writes in load_dag_element and
+    // for direct uint64* cast in blake2b_hash_32.
+    __align__(16) uint8_t sum[32] = {};
+    __align__(16) uint8_t elem[32];
+    #pragma unroll 8
     for(int k=0; k<32; k++){
         load_dag_element(dag, idx[k], elem);
         add256(sum, elem);

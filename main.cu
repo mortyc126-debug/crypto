@@ -564,12 +564,12 @@ static void dag_selftest(const uint8_t* d_dag, uint64_t height) {
 static void gpu_mine_loop(){
     CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize,4096));
 
-    // FIX v0.7: increased BLOCKS from 112 to 448 (28 SM * 16 blocks/SM)
-    // This gives ~4x more GPU threads per batch -> ~4x hashrate improvement.
-    // RTX 3060 has 28 SMs; 16 blocks/SM * 256 threads = 4096 threads/SM = good occupancy.
+    // RTX 3060: 28 SMs, max 48 warps/SM, 256 threads = 8 warps/block -> 6 resident blocks/SM.
+    // 32 blocks/SM queued gives the scheduler plenty of work to hide DRAM latency
+    // during the 32 random DAG reads per nonce (dominant bottleneck).
     const int THREADS = 256;
-    const int BLOCKS  = 28 * 16;   // 448 blocks (was 28*4=112)
-    const uint32_t BATCH = THREADS * BLOCKS;  // 114688 (was 14336)
+    const int BLOCKS  = 28 * 32;   // 896 blocks (was 448)
+    const uint32_t BATCH = THREADS * BLOCKS;  // 229376 (was 114688)
 
     CUDA_CHECK(cudaMalloc(&d_result,    sizeof(MineResult)));
     CUDA_CHECK(cudaMalloc(&d_target,    8*sizeof(uint32_t)));
@@ -746,7 +746,7 @@ int main(){
     CUDA_CHECK(cudaSetDevice(0));
     cudaDeviceProp prop; cudaGetDeviceProperties(&prop,0);
     LOG("[GPU] %s  SM=%d  VRAM=%.0fMB\n",prop.name,prop.multiProcessorCount,prop.totalGlobalMem/1048576.0);
-    LOG("[GPU] Batch size: %d threads (%d blocks x %d threads)\n", 256*28*16, 28*16, 256);
+    LOG("[GPU] Batch size: %d threads (%d blocks x %d threads)\n", 256*28*32, 28*32, 256);
 
     std::thread(hashrate_thread).detach();
     std::thread(keepalive_thread).detach();
