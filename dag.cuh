@@ -50,11 +50,16 @@ __global__ void dag_gen_kernel(
           blake2b_compress(h, mz, (uint64_t)(blk+1)*128ULL, 0ULL, false);
       blake2b_compress(h, mz, 8208ULL, 0ULL, true); }
 
-    // FIX v0.16: use all 32 bytes of the hash output as the element value
-    // (Ergo reference: BigInt(1, hash) uses all 32 bytes; do not force out[0]=0)
+    // FIX v0.20: DAG element is last 31 bytes of blake2b output.
+    // Pool (ErgoStratumServer) computes: blake2b(i||h||M).slice(1, 32)
+    // i.e. drops byte[0] (LE_byte[0] = LSB of first word) and keeps bytes[1..31].
+    // Those 31 bytes are treated as a big-endian 248-bit integer (via toBigIntBE).
+    // In add256 (big-endian addition, carry from index 31→0), we store:
+    //   out[0]=0 (MSB, was the discarded LE_byte[0]), out[1..31]=LE_byte[1..31].
     uint8_t* out = dag + i * 32;
+    out[0] = 0;
     #pragma unroll
-    for(int b=0; b<32; b++)
+    for(int b=1; b<32; b++)
         out[b] = (uint8_t)((h[b/8] >> ((b%8)*8)) & 0xFF);
 }
 
