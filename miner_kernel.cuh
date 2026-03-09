@@ -58,7 +58,7 @@ __device__ __forceinline__ void blake2b_hash_32(const uint8_t* in, uint64_t out[
     out[0]=h[0]; out[1]=h[1]; out[2]=h[2]; out[3]=h[3];
 }
 
-__global__ __launch_bounds__(256, 6) void mine_kernel(
+__global__ void mine_kernel(
     const uint8_t* __restrict__ dag,
     uint64_t N,
     const uint64_t* __restrict__ blob_words,
@@ -163,7 +163,7 @@ __global__ __launch_bounds__(256, 6) void mine_kernel(
     // for direct uint64* cast in blake2b_hash_32.
     __align__(16) uint8_t sum[32] = {};
     __align__(16) uint8_t elem[32];
-    #pragma unroll 8
+    #pragma unroll 4
     for(int k=0; k<32; k++){
         load_dag_element(dag, idx[k], elem);
         add256(sum, elem);
