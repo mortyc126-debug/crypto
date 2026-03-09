@@ -1,4 +1,7 @@
-// ErgoMiner v0.16
+// ErgoMiner v0.17
+// Fix v0.17: Rebuild DAG on every block height change, not only when epoch N changes.
+//            DAG elements embed the exact block height (Blake2b input), so reusing a
+//            DAG from a previous height causes every share to fail pool verification.
 // Fix v0.16: DAG element generation now uses big-endian encoding of index and height
 //            (matching Ergo reference Longs.toByteArray), and uses all 32 hash bytes
 //            as the element value (was forcing out[0]=0 and skipping hash[0]).
@@ -104,6 +107,7 @@ static std::string bytes2hex(const uint8_t* bytes,int len){
 
 static uint8_t*    d_dag        = nullptr;
 static uint64_t    dag_N        = 0;
+static uint64_t    dag_height   = 0;  // block height DAG was built for
 static MineResult* d_result     = nullptr;
 static uint32_t*   d_target     = nullptr;
 static uint64_t*   d_blob_words = nullptr;
@@ -464,7 +468,7 @@ static void stratum_recv_thread(){
 
 static void stratum_subscribe(){
     char buf[256];
-    snprintf(buf,sizeof(buf),"{\"id\":%d,\"method\":\"mining.subscribe\",\"params\":[\"ergominer/0.16\"]}",g_msg_id.fetch_add(1));
+    snprintf(buf,sizeof(buf),"{\"id\":%d,\"method\":\"mining.subscribe\",\"params\":[\"ergominer/0.17\"]}",g_msg_id.fetch_add(1));
     send_line(buf);
 }
 static void stratum_authorize(){
@@ -559,17 +563,21 @@ static void gpu_mine_loop(){
         if(!have_job){Sleep(100);continue;}
 
         // DAG rebuild if needed
+        // FIX v0.17: DAG elements embed the exact block height (Blake2b input).
+        // Rebuild whenever height changes, not only when epoch N changes.
         {
             uint64_t needed_N=autolykos_n(cur.height);
-            if(needed_N!=dag_N||d_dag==nullptr){
-                if(d_dag){cudaFree(d_dag);d_dag=nullptr;dag_N=0;}
+            if(needed_N!=dag_N||cur.height!=dag_height||d_dag==nullptr){
+                if(d_dag){cudaFree(d_dag);d_dag=nullptr;dag_N=0;dag_height=0;}
                 DWORD t0=GetTickCount();
                 if(build_dag(&d_dag,cur.height,&dag_N)!=cudaSuccess){
                     Sleep(5000);continue;
                 }
+                dag_height=cur.height;
                 size_t fb,tb; cudaMemGetInfo(&fb,&tb);
-                LOG("[GPU] DAG OK N=%llu time=%.1fs free=%.0fMB\n",
-                    (unsigned long long)dag_N,(GetTickCount()-t0)/1000.0,fb/1048576.0);
+                LOG("[GPU] DAG OK N=%llu height=%llu time=%.1fs free=%.0fMB\n",
+                    (unsigned long long)dag_N,(unsigned long long)dag_height,
+                    (GetTickCount()-t0)/1000.0,fb/1048576.0);
                 dag_selftest(d_dag, cur.height);
             }
         }
@@ -700,7 +708,8 @@ static void hashrate_thread(){
 
 int main(){
     srand((unsigned)time(nullptr));
-    LOG("=== ErgoMiner v0.16 ===\n");
+    LOG("=== ErgoMiner v0.17 ===\n");
+    LOG("[FIX] Rebuild DAG on every block height change (elements embed exact height)\n");
     LOG("[FIX] DAG element: big-endian index/height + full 32-byte hash output\n");
     LOG("[FIX] 256-bit (32-byte) DAG element sum + 32-byte final hash input\n");
     LOG("[FIX] Blake2b-256 for seed hash, genIndexes double-hash, contiguous sliding window\n");
