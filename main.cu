@@ -1,4 +1,4 @@
-// ErgoMiner v0.13
+// ErgoMiner v0.14
 // Fix v0.12: Sum 32 DAG elements as 256-bit (32 bytes), not 248-bit (31 bytes).
 //            The carry into the high byte was lost, causing wrong final hash.
 //            Also hash 32-byte sum (was hashing only 31 bytes).
@@ -461,7 +461,7 @@ static void stratum_recv_thread(){
 
 static void stratum_subscribe(){
     char buf[256];
-    snprintf(buf,sizeof(buf),"{\"id\":%d,\"method\":\"mining.subscribe\",\"params\":[\"ergominer/0.13\"]}",g_msg_id.fetch_add(1));
+    snprintf(buf,sizeof(buf),"{\"id\":%d,\"method\":\"mining.subscribe\",\"params\":[\"ergominer/0.14\"]}",g_msg_id.fetch_add(1));
     send_line(buf);
 }
 static void stratum_authorize(){
@@ -472,9 +472,7 @@ static void stratum_authorize(){
 }
 
 static void stratum_submit(const std::string& job_id, uint64_t nonce_found){
-    // FIX v0.8: 2miners Ergo stratum expects the FULL nonce (en1+en2) as a single hex string,
-    // not just en2. nonce_total_size=6 bytes = 12 hex chars.
-    // e.g. en1=d628, en2=4b549d40 -> submit "d6284b549d40"
+    // Build full 8-byte nonce: en1 (high bytes) | en2 (low bytes)
     uint64_t en2_mask = (g_extranonce2_size >= 8) ? 0xFFFFFFFFFFFFFFFFULL
                                                    : ((1ULL << (g_extranonce2_size*8)) - 1ULL);
     uint64_t en2_val = nonce_found & en2_mask;
@@ -483,8 +481,15 @@ static void stratum_submit(const std::string& job_id, uint64_t nonce_found){
     char fmt[16]; sprintf(fmt, "%%0%dllx", g_extranonce2_size*2);
     sprintf(en2_hex, fmt, (unsigned long long)en2_val);
 
-    // Full nonce = en1 + en2 (total nonce_total_size bytes = nonce_total_size*2 hex chars)
-    std::string full_nonce = g_extranonce1 + std::string(en2_hex);
+    // Full nonce big-endian hex = en1 + en2
+    std::string be_nonce = g_extranonce1 + std::string(en2_hex);
+
+    // FIX v0.14: Ergo stratum expects nonce in little-endian byte order.
+    // Reverse bytes: "086d00000aecda69" -> "69daec0a00006d08"
+    std::string le_nonce;
+    for(int i = (int)be_nonce.size() - 2; i >= 0; i -= 2){
+        le_nonce += be_nonce.substr(i, 2);
+    }
 
     int sid = g_msg_id.fetch_add(1);
     { std::lock_guard<std::mutex> lk(g_pending_mutex); g_pending_submits.insert(sid); }
@@ -492,12 +497,12 @@ static void stratum_submit(const std::string& job_id, uint64_t nonce_found){
     char buf[1024];
     std::string u = std::string(WALLET_ADDR) + "." + WORKER_NAME;
     snprintf(buf, sizeof(buf), "{\"id\":%d,\"method\":\"mining.submit\",\"params\":[\"%s\",\"%s\",\"%s\"]}",
-        sid, u.c_str(), job_id.c_str(), full_nonce.c_str());
+        sid, u.c_str(), job_id.c_str(), le_nonce.c_str());
     send_line(buf);
 
-    LOG("[SUBMIT] job=%s nonce=%016llx en1=%s en2=%s full=%s\n",
+    LOG("[SUBMIT] job=%s nonce=%016llx en1=%s en2=%s BE=%s LE=%s\n",
         job_id.c_str(), (unsigned long long)nonce_found,
-        g_extranonce1.c_str(), en2_hex, full_nonce.c_str());
+        g_extranonce1.c_str(), en2_hex, be_nonce.c_str(), le_nonce.c_str());
 }
 
 // ===== DAG Self-Test =====
@@ -696,7 +701,7 @@ static void hashrate_thread(){
 
 int main(){
     srand((unsigned)time(nullptr));
-    LOG("=== ErgoMiner v0.13 ===\n");
+    LOG("=== ErgoMiner v0.14 ===\n");
     LOG("[FIX] 256-bit (32-byte) DAG element sum + 32-byte final hash input\n");
     LOG("[FIX] Blake2b-256 for seed hash, genIndexes double-hash, contiguous sliding window\n");
     LOG("[FIX] nonce hashed as big-endian bytes (matches pool verification)\n");
