@@ -1,10 +1,10 @@
-// ErgoMiner v0.18
+// ErgoMiner v0.19
+// Fix v0.19: Use epoch-level height for DAG generation (confirmed by "Low difficulty" rejection).
+//            The pool validates shares using epoch_height = 614400 + floor((h-614400)/51200)*51200,
+//            not the exact block height. All blocks in epoch 21 (heights 1689600-1740799) share
+//            the same DAG. Rebuild only when epoch changes (~once every 71 days).
 // Fix v0.18: Remove per-chunk cudaDeviceSynchronize in DAG generation.
-//            2853 sync barriers held GPU at ~1% utilization (43s build time).
-//            All chunks now launch async; single sync at end cuts build to ~2-5s.
-// Fix v0.17: Rebuild DAG on every block height change, not only when epoch N changes.
-//            DAG elements embed the exact block height (Blake2b input), so reusing a
-//            DAG from a previous height causes every share to fail pool verification.
+// Fix v0.17: (reverted) Rebuild on every height change — was correct but pool uses epoch height.
 // Fix v0.16: DAG element generation now uses big-endian encoding of index and height
 //            (matching Ergo reference Longs.toByteArray), and uses all 32 hash bytes
 //            as the element value (was forcing out[0]=0 and skipping hash[0]).
@@ -110,7 +110,17 @@ static std::string bytes2hex(const uint8_t* bytes,int len){
 
 static uint8_t*    d_dag        = nullptr;
 static uint64_t    dag_N        = 0;
-static uint64_t    dag_height   = 0;  // block height DAG was built for
+static uint64_t    dag_height   = 0;  // epoch height DAG was built for
+
+// Ergo Autolykos v2: DAG elements embed epoch_height, not exact block height.
+// The pool validates shares using the same epoch_height formula.
+static uint64_t ergo_epoch_height(uint64_t block_height) {
+    const uint64_t EPOCH_START  = 614400ULL;
+    const uint64_t EPOCH_PERIOD = 51200ULL;
+    if (block_height < EPOCH_START) return 0;
+    uint64_t epoch = (block_height - EPOCH_START) / EPOCH_PERIOD;
+    return EPOCH_START + epoch * EPOCH_PERIOD;
+}
 static MineResult* d_result     = nullptr;
 static uint32_t*   d_target     = nullptr;
 static uint64_t*   d_blob_words = nullptr;
@@ -471,7 +481,7 @@ static void stratum_recv_thread(){
 
 static void stratum_subscribe(){
     char buf[256];
-    snprintf(buf,sizeof(buf),"{\"id\":%d,\"method\":\"mining.subscribe\",\"params\":[\"ergominer/0.18\"]}",g_msg_id.fetch_add(1));
+    snprintf(buf,sizeof(buf),"{\"id\":%d,\"method\":\"mining.subscribe\",\"params\":[\"ergominer/0.19\"]}",g_msg_id.fetch_add(1));
     send_line(buf);
 }
 static void stratum_authorize(){
@@ -566,22 +576,26 @@ static void gpu_mine_loop(){
         if(!have_job){Sleep(100);continue;}
 
         // DAG rebuild if needed
-        // FIX v0.17: DAG elements embed the exact block height (Blake2b input).
-        // Rebuild whenever height changes, not only when epoch N changes.
+        // FIX v0.19: pool validates shares using epoch_height (start of current epoch),
+        // not the exact block height. Rebuild only when epoch changes (~once per 71 days).
         {
-            uint64_t needed_N=autolykos_n(cur.height);
-            if(needed_N!=dag_N||cur.height!=dag_height||d_dag==nullptr){
+            uint64_t ep_height = ergo_epoch_height(cur.height);
+            uint64_t needed_N  = autolykos_n(cur.height);
+            if(needed_N!=dag_N || ep_height!=dag_height || d_dag==nullptr){
                 if(d_dag){cudaFree(d_dag);d_dag=nullptr;dag_N=0;dag_height=0;}
+                LOG("[DAG] epoch_height=%llu (block=%llu)\n",
+                    (unsigned long long)ep_height,(unsigned long long)cur.height);
                 DWORD t0=GetTickCount();
-                if(build_dag(&d_dag,cur.height,&dag_N)!=cudaSuccess){
+                if(build_dag(&d_dag,ep_height,&dag_N)!=cudaSuccess){
                     Sleep(5000);continue;
                 }
-                dag_height=cur.height;
+                dag_height=ep_height;
                 size_t fb,tb; cudaMemGetInfo(&fb,&tb);
-                LOG("[GPU] DAG OK N=%llu height=%llu time=%.1fs free=%.0fMB\n",
+                LOG("[GPU] DAG OK N=%llu epoch_h=%llu block_h=%llu time=%.1fs free=%.0fMB\n",
                     (unsigned long long)dag_N,(unsigned long long)dag_height,
+                    (unsigned long long)cur.height,
                     (GetTickCount()-t0)/1000.0,fb/1048576.0);
-                dag_selftest(d_dag, cur.height);
+                dag_selftest(d_dag, dag_height);
             }
         }
 
@@ -711,9 +725,9 @@ static void hashrate_thread(){
 
 int main(){
     srand((unsigned)time(nullptr));
-    LOG("=== ErgoMiner v0.18 ===\n");
-    LOG("[FIX] Async DAG generation: 2853 sync barriers removed, ~10-20x faster build\n");
-    LOG("[FIX] Rebuild DAG on every block height change (elements embed exact height)\n");
+    LOG("=== ErgoMiner v0.19 ===\n");
+    LOG("[FIX] Epoch-level DAG: pool uses epoch_height for verification, rebuild ~once per 71 days\n");
+    LOG("[FIX] Async DAG generation: sync barriers removed, fast build\n");
     LOG("[FIX] DAG element: big-endian index/height + full 32-byte hash output\n");
     LOG("[FIX] 256-bit (32-byte) DAG element sum + 32-byte final hash input\n");
     LOG("[FIX] Blake2b-256 for seed hash, genIndexes double-hash, contiguous sliding window\n");
